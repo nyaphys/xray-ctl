@@ -27,7 +27,7 @@ TEST_URLS = (
 DEFAULT_WORKERS = min(32, max(16, (os.cpu_count() or 8)*2))
 DEFAULT_PROBE_TIMEOUT = 8
 COLOR = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 def paint(code,text): return f"\033[{code}m{text}\033[0m" if COLOR else text
 
@@ -509,27 +509,76 @@ def speedtest(timeout=20):
 def pingtest(timeout=10):
     successful=[value for value in probe_urls(LOCAL_PROXY,TEST_URLS,timeout) if value is not None]
     return round(min(successful),1) if successful else None
+def routes_healthy():
+    if not pathlib.Path('/sys/class/net/blanc0').exists(): return False
+    families=['-4']
+    if pathlib.Path('/proc/net/if_inet6').exists(): families.append('-6')
+    for family in families:
+        rules=subprocess.run(['ip',family,'rule','show'],capture_output=True,text=True)
+        routes=subprocess.run(['ip',family,'route','show','table','4269'],capture_output=True,text=True)
+        if rules.returncode or routes.returncode: return False
+        if 'lookup 4269' not in (rules.stdout or ''): return False
+        if not any(line.split()[:3]==['default','dev','blanc0'] for line in (routes.stdout or '').splitlines()):
+            return False
+    return True
 def failover(_):
+    threshold=max(1,int(os.getenv('BLANCCTL_FAILOVER_FAILURES','3')))
+    timeout=max(1,float(os.getenv('BLANCCTL_FAILOVER_TIMEOUT','5')))
+    max_candidates=max(1,int(os.getenv('BLANCCTL_FAILOVER_CANDIDATES','6')))
     active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
     if not active:
-        print("BlancVPN is stopped; skipping this failover check.")
-        return
+        failed=subprocess.run(['systemctl','is-failed','--quiet','blancctl.service']).returncode==0
+        if not failed:
+            print("BlancVPN is stopped; skipping this failover check.")
+            return
+        with try_operation_lock() as available:
+            if not available:
+                print("Configuration operation in progress; skipping this failover check.")
+                return
+            if subprocess.run(['systemctl','is-failed','--quiet','blancctl.service']).returncode==0:
+                print("BlancVPN service failed; attempting to restart it.")
+                try: service('restart')
+                except SystemExit: print("Service restart failed; checking cached alternatives.")
+        active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
+        failed=True
+    else:
+        failed=False
     with try_operation_lock() as available:
         if not available:
             print("Configuration operation in progress; skipping this failover check.")
             return
-    threshold=max(1,int(os.getenv('BLANCCTL_FAILOVER_FAILURES','3')))
-    timeout=max(1,float(os.getenv('BLANCCTL_FAILOVER_TIMEOUT','5')))
-    max_candidates=max(1,int(os.getenv('BLANCCTL_FAILOVER_CANDIDATES','6')))
     state=load(FAILOVER,{})
     selected=load(PICK,{})
     disabled_current=disabled_node(selected)
-    latency=None if disabled_current else pingtest(timeout)
+    latency=None if disabled_current or not active else pingtest(timeout)
     if latency is not None:
+        if not routes_healthy():
+            now=int(time.time())
+            if now-state.get('route_repair_at',0)<120:
+                print("TUN route is still unavailable; waiting before another repair attempt.")
+                return
+            with try_operation_lock() as available:
+                if not available:
+                    print("Configuration operation in progress; deferring TUN route repair.")
+                    return
+                still_active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
+                if not still_active or load(PICK,{}).get('id')!=selected.get('id'):
+                    print("Connection changed during the check; deferring TUN route repair.")
+                    return
+                save(FAILOVER,{**state,'route_repair_at':now,'checked_at':now})
+                state['route_repair_at']=now
+                print("TUN route is unavailable; restarting Xray to restore it.")
+                try: service('restart')
+                except SystemExit:
+                    print("TUN route repair failed; will retry later.")
+                    return
+            if not routes_healthy() or pingtest(timeout) is None:
+                print("TUN route remains unavailable after restart; will retry later.")
+                return
         if state.get('failures',0): print(f"Connection recovered: {latency:.0f} ms")
-        save(FAILOVER,{'failures':0,'checked_at':int(time.time())})
+        save(FAILOVER,{**state,'failures':0,'checked_at':int(time.time())})
         return
-    failures=threshold if disabled_current else state.get('failures',0)+1
+    failures=threshold if disabled_current or failed else state.get('failures',0)+1
     save(FAILOVER,{'failures':failures,'checked_at':int(time.time())})
     if failures < threshold:
         print(f"Health check failed ({failures}/{threshold}); keeping the current server.")
@@ -545,22 +594,42 @@ def failover(_):
     candidates=diverse_candidates(candidates,max_candidates)
     reason="Selected Russia endpoint is disabled" if disabled_current else f"Current server failed {failures} checks"
     print(f"{reason}; testing {len(candidates)} alternatives…")
-    for n in candidates:
-        _,candidate_latency,_=test(n,timeout,urls=TEST_URLS)
-        if candidate_latency is None: continue
+    if not candidates:
+        print("No alternative cached server is available; will retry later.")
+        return
+    working=[]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8,len(candidates))) as pool:
+        probes={pool.submit(test,n,timeout,urls=TEST_URLS):n for n in candidates}
+        for future in concurrent.futures.as_completed(probes):
+            try: _,candidate_latency,sites=future.result()
+            except Exception: continue
+            if candidate_latency is not None:
+                working.append((probes[future],candidate_latency,sum(value is not None for value in sites)))
+    working.sort(key=lambda item:(-item[2],item[1]))
+    for n,candidate_latency,_ in working:
         with try_operation_lock() as available:
             if not available:
                 print("Configuration operation started during the check; deferring failover.")
                 return
-            recovered_latency=None if disabled_current else pingtest(timeout)
+            if load(PICK,{}).get('id')!=selected.get('id'):
+                print("Selected server changed during the check; deferring failover.")
+                return
+            now_active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
+            if not now_active and subprocess.run(['systemctl','is-failed','--quiet','blancctl.service']).returncode!=0:
+                print("BlancVPN was stopped during the check; not reconnecting.")
+                return
+            recovered_latency=None if disabled_current or not now_active else pingtest(timeout)
             if recovered_latency is not None:
                 print(f"Connection recovered during failover testing: {recovered_latency:.0f} ms")
                 save(FAILOVER,{'failures':0,'checked_at':int(time.time())})
                 return
             print(f"Failing over to {n['label']} ({candidate_latency:.0f} ms).")
-            select(n,ping=candidate_latency)
+            try: select(n,ping=candidate_latency)
+            except SystemExit:
+                print("Alternative failed its live check; trying the next cached server.")
+                continue
             save(FAILOVER,{'failures':0,'checked_at':int(time.time()),'switched_at':int(time.time())})
-        return
+            return
     print("Failover could not find a working cached server; will retry later.")
 def record_speed():
     stats=load(STATS,{}); stats['speed_mbps']=speedtest(); stats['tested_at']=int(time.time()); save(STATS,stats)
@@ -858,10 +927,7 @@ def status(_):
     active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
     pick=load(PICK,{}); stats=load(STATS,{})
     if not active: print(f"{paint('2','○ BlancVPN')}  {paint('31','off')}"); return
-    rules=subprocess.run(['ip','-4','rule','show'],capture_output=True,text=True).stdout
-    ipv6_rules=subprocess.run(['ip','-6','rule','show'],capture_output=True,text=True).stdout \
-        if pathlib.Path('/proc/net/if_inet6').exists() else 'lookup 4269'
-    if 'lookup 4269' not in rules or 'lookup 4269' not in ipv6_rules:
+    if not routes_healthy():
         print(f"{paint('1;31','! BlancVPN')}  {paint('33','route unavailable')} · run: xray-ctl log"); return
     place=' '.join(x for x in (pick.get('country_code'),pick.get('country')) if x) or 'unknown'
     ping_value=pingtest(); speed_value=speedtest() if ping_value is not None else None
@@ -888,7 +954,7 @@ def main():
     s.add_parser('stop').set_defaults(fn=lambda _:service('stop'))
     s.add_parser('failover-check',help=argparse.SUPPRESS).set_defaults(fn=failover)
     a=p.parse_args(); fn=start if a.cmd is None else a.fn
-    if a.cmd in (None,'start','country','update','best','subscription','route'):
+    if a.cmd in (None,'start','stop','country','update','best','subscription','route'):
         try:
             with operation_lock(): fn(a)
         finally:

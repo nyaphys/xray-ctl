@@ -37,7 +37,11 @@ in
     };
 
     failover = {
-      enable = lib.mkEnableOption "periodic BlancVPN connectivity checks and automatic failover";
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Periodically check connectivity and recover or change servers after repeated failures.";
+      };
 
       interval = lib.mkOption {
         type = lib.types.str;

@@ -59,7 +59,6 @@ user that should own the VPN configuration:
     user = "your-user";
     group = "users";
     autoStart = true;
-    failover.enable = true;
   };
 }
 ```
@@ -232,22 +231,31 @@ in the private raw subscription but are not offered as working nodes. Unlike
 NekoBox, `xray-ctl` does not use sing-box, and carrier-specific Extra profiles
 still depend on the subscription settings enabled by the provider.
 
-Optional automatic failover is provided by `blancctl-failover.timer`. It checks
-the live SOCKS path against all four sites every 30 seconds and switches only
-after three consecutive checks in which none are reachable. Alternatives come
-from the cached subscription list, are ordered by
-their last measured latency, and the six best candidates are tested directly
-before selection. Endpoint probes do not hold the configuration lock; the lock
-is taken only while changing the selected server. A failover pass is scheduled
-30 seconds after the previous pass finishes, preventing back-to-back retries
-when every endpoint is unavailable. Checks remain idle while `blancctl.service`
-is stopped, so `blancctl stop` does not trigger endpoint scans or reconnect the
-VPN. Enable it
-after setup with:
+Automatic monitoring is enabled by `xray-ctl-setup` on Arch and by default in
+the NixOS module. `blancctl-failover.timer` checks the live SOCKS path against
+all four sites every 30 seconds. A transient failure keeps the current node;
+the timer switches only after three consecutive checks in which none of the
+sites are reachable. The six best distinct cached alternatives are tested in
+parallel, prioritizing site coverage and then latency. A failed Xray systemd
+unit is restarted before changing nodes. If the SOCKS path works but the TUN
+policy route is missing, the timer first restarts Xray to restore that route,
+with a cooldown between repair attempts. Endpoint probes do not hold the
+configuration lock; the lock is taken only while changing the selected server.
+A failover pass is scheduled 30 seconds after the previous pass finishes,
+preventing back-to-back retries when every endpoint is unavailable. Checks
+remain idle after a deliberate `xray-ctl stop`; that command does not trigger
+endpoint scans or reconnect the VPN. If upgrading an older Arch installation,
+run `sudo xray-ctl-setup "$USER"` again to enable the timer, or run:
 
 ```text
 sudo systemctl enable --now blancctl-failover.timer
 ```
+
+To opt out on Arch, disable the timer with `sudo systemctl disable --now
+blancctl-failover.timer`; on NixOS set `services.xrayCtl.failover.enable =
+false`. Re-running Arch setup enables it again. Switching nodes briefly
+interrupts active connections, so this is automatic recovery, not a guarantee
+of zero packet loss or a kill switch.
 
 The defaults can be overridden in the failover service environment with
 `BLANCCTL_FAILOVER_FAILURES`, `BLANCCTL_FAILOVER_TIMEOUT`, and

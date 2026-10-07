@@ -52,4 +52,5 @@ chmod 0644 "$failover_dropin_dir/owner.conf"
 
 systemctl daemon-reload
 systemctl reset-failed blancctl.service 2>/dev/null || true
-echo "xray-ctl configured for $owner; run 'xray-ctl doctor' as that user"
+systemctl enable --now blancctl-failover.timer
+echo "xray-ctl configured for $owner with automatic connection monitoring; run 'xray-ctl doctor' as that user"
