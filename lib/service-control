@@ -22,7 +22,8 @@ case "${1:-}" in
         exec /usr/bin/systemctl restart blancctl.service
         ;;
     stop)
-        exec /usr/bin/systemctl stop blancctl.service
+        /usr/bin/systemctl stop blancctl.service
+        exec /usr/bin/systemctl reset-failed blancctl.service
         ;;
     status)
         exec /usr/bin/systemctl --no-pager --full status blancctl.service
