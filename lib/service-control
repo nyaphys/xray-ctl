@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { echo "blancctl: service-control must run as root" >&2; exit 1; }
+[[ -r /etc/blancctl/owner ]] || { echo "blancctl: setup is incomplete" >&2; exit 1; }
+owner="$(< /etc/blancctl/owner)"
+owner_uid="$(id -u "$owner" 2>/dev/null)" || { echo "blancctl: configured owner does not exist" >&2; exit 1; }
+if [[ ${SUDO_UID:-} != "$owner_uid" ]]; then
+    echo "blancctl: caller is not the configured owner" >&2
+    exit 1
+fi
+
+case "${1:-}" in
+    check)
+        exit 0
+        ;;
+    start|restart)
+        /usr/bin/systemctl reset-failed blancctl.service 2>/dev/null || true
+        # NixOS owns enablement declaratively through services.blancctl.autoStart.
+        # Other distributions retain the original enable-on-first-start behavior.
+        [[ -e /etc/NIXOS ]] || /usr/bin/systemctl enable blancctl.service >/dev/null
+        exec /usr/bin/systemctl restart blancctl.service
+        ;;
+    stop)
+        exec /usr/bin/systemctl stop blancctl.service
+        ;;
+    status)
+        exec /usr/bin/systemctl --no-pager --full status blancctl.service
+        ;;
+    log)
+        invocation="$(/usr/bin/systemctl show blancctl.service -p InvocationID --value)"
+        if [[ -n "$invocation" ]]; then
+            exec /usr/bin/journalctl "_SYSTEMD_INVOCATION_ID=$invocation" -n 100 --no-pager --output=short-precise
+        fi
+        exec /usr/bin/journalctl -u blancctl.service -n 100 --no-pager --output=short-precise
+        ;;
+    *)
+        echo "usage: service-control {check|start|stop|restart|status|log}" >&2
+        exit 2
+        ;;
+esac

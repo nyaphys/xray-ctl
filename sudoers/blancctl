@@ -1,0 +1,11 @@
+# Package-owned BlancCTL service authorization. The helper independently checks
+# SUDO_UID against /etc/blancctl/owner before performing any action.
+# Command-specific authentication policy remains effective even if a later
+# generic wheel rule carries the PASSWD tag.
+Defaults!/usr/lib/blancctl/service-control !authenticate
+ALL ALL=(root) NOPASSWD: /usr/lib/blancctl/service-control check
+ALL ALL=(root) NOPASSWD: /usr/lib/blancctl/service-control start
+ALL ALL=(root) NOPASSWD: /usr/lib/blancctl/service-control stop
+ALL ALL=(root) NOPASSWD: /usr/lib/blancctl/service-control restart
+ALL ALL=(root) NOPASSWD: /usr/lib/blancctl/service-control status
+ALL ALL=(root) NOPASSWD: /usr/lib/blancctl/service-control log

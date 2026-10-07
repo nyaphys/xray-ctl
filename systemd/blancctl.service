@@ -1,0 +1,22 @@
+[Unit]
+Description=BlancVPN Xray TUN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/xray run -c /var/lib/blancctl/xray.json
+ExecStartPost=/usr/lib/blancctl/tun-route start
+ExecStopPost=/usr/lib/blancctl/tun-route stop
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/var/lib/blancctl
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

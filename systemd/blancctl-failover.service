@@ -1,0 +1,13 @@
+[Unit]
+Description=BlancVPN connectivity check and automatic failover
+After=network-online.target blancctl.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/blancctl failover-check
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/blancctl

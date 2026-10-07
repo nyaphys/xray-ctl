@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( EUID != 0 )); then
+    echo "usage: sudo xray-ctl-setup USER" >&2
+    exit 1
+fi
+
+owner="${1:-}"
+if [[ -z "$owner" ]] || ! id "$owner" >/dev/null 2>&1; then
+    echo "xray-ctl-setup: valid user name required" >&2
+    exit 2
+fi
+if [[ "$owner" == root ]] || [[ "$(id -u "$owner")" == 0 ]]; then
+    echo "xray-ctl-setup: refusing to configure xray-ctl for root" >&2
+    exit 2
+fi
+owner_group="$(id -gn "$owner")"
+
+sudoers=/etc/sudoers.d/blancctl
+[[ -r "$sudoers" ]] || {
+    echo "xray-ctl-setup: package authorization file is missing; reinstall xray-ctl" >&2
+    exit 3
+}
+visudo -cf "$sudoers" >/dev/null
+
+install -d -m 0755 /etc/blancctl
+printf '%s\n' "$owner" > /etc/blancctl/owner
+chmod 0644 /etc/blancctl/owner
+install -d -o "$owner" -g "$owner_group" -m 0700 /var/lib/blancctl
+chown -R "$owner:$owner_group" /var/lib/blancctl
+find /var/lib/blancctl -type d -exec chmod 0700 {} +
+find /var/lib/blancctl -type f -exec chmod 0600 {} +
+
+dropin_dir=/etc/systemd/system/blancctl.service.d
+install -d -m 0755 "$dropin_dir"
+{
+    printf '[Service]\n'
+    printf 'User=%s\n' "$owner"
+    printf 'Group=%s\n' "$owner_group"
+} > "$dropin_dir/owner.conf"
+chmod 0644 "$dropin_dir/owner.conf"
+
+failover_dropin_dir=/etc/systemd/system/blancctl-failover.service.d
+install -d -m 0755 "$failover_dropin_dir"
+{
+    printf '[Service]\n'
+    printf 'User=%s\n' "$owner"
+    printf 'Group=%s\n' "$owner_group"
+} > "$failover_dropin_dir/owner.conf"
+chmod 0644 "$failover_dropin_dir/owner.conf"
+
+systemctl daemon-reload
+systemctl reset-failed blancctl.service 2>/dev/null || true
+echo "xray-ctl configured for $owner; run 'xray-ctl doctor' as that user"

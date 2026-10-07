@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+table=4269
+priority=1042
+private_networks=(
+    10.0.0.0/8
+    100.64.0.0/10
+    169.254.0.0/16
+    172.16.0.0/12
+    192.168.0.0/16
+    224.0.0.0/4
+    255.255.255.255/32
+)
+private_networks6=(
+    ::1/128
+    fc00::/7
+    fe80::/10
+    ff00::/8
+)
+
+stop_routes() {
+    while ip -4 rule del priority "$priority" table "$table" 2>/dev/null; do :; done
+    ip -4 route flush table "$table" 2>/dev/null || true
+    while ip -6 rule del priority "$priority" table "$table" 2>/dev/null; do :; done
+    ip -6 route flush table "$table" 2>/dev/null || true
+}
+
+case "${1:-}" in
+    start)
+        stop_routes
+        for _ in {1..50}; do
+            [[ -e /sys/class/net/blanc0 ]] && break
+            sleep 0.1
+        done
+        [[ -e /sys/class/net/blanc0 ]] || { echo "blancctl: blanc0 was not created" >&2; exit 1; }
+        ip link set blanc0 up
+        ip address replace 172.30.0.1/30 dev blanc0
+        # Leave local and private destinations to the main routing table. A
+        # throw route ends this table's lookup without selecting blanc0, so
+        # LAN traffic never enters Xray and survives service restarts.
+        for network in "${private_networks[@]}"; do
+            ip -4 route replace throw "$network" table "$table"
+        done
+        ip -4 route replace default dev blanc0 table "$table"
+        ip -4 rule add priority "$priority" table "$table"
+        # Route public IPv6 through the same TUN. Without this rule a dual-stack
+        # browser could bypass the proxy over the host's ordinary IPv6 default.
+        if [[ -e /proc/net/if_inet6 ]]; then
+            ip -6 address replace fd30::1/126 dev blanc0
+            for network in "${private_networks6[@]}"; do
+                ip -6 route replace throw "$network" table "$table"
+            done
+            ip -6 route replace default dev blanc0 table "$table"
+            ip -6 rule add priority "$priority" table "$table"
+        fi
+        ;;
+    stop)
+        stop_routes
+        ;;
+    *)
+        echo "usage: tun-route {start|stop}" >&2
+        exit 2
+        ;;
+esac
