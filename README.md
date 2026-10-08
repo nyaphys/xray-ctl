@@ -183,15 +183,20 @@ by default). Profiles sharing one endpoint are summarized on one output line,
 but each is still tested and can be selected independently. Each profile checks
 Cloudflare, Telegram, ChatGPT, and YouTube concurrently
 through one temporary SOCKS proxy. The result shows which of the four returned
-HTTP success (2xx/3xx). Servers reaching more sites rank first, then by
-latency; one site's 4xx or 5xx response does not make an otherwise working
-server disappear. A small GET range avoids HEAD-only responses that differ
-from browser requests. The
+HTTP success (2xx/3xx). Servers reaching more sites rank first; the initial
+choice among them uses latency. One site's 4xx or 5xx response does not make
+an otherwise working server disappear. A small GET range avoids HEAD-only
+responses that differ from browser requests. The
 per-endpoint timeout is adaptive:
 5.5 seconds for an unmeasured server and a value based on previous latency,
-capped by `--timeout` (8 seconds by default). `best` does not wait for a
-download speed test; `status` still measures live download speed. After a
-switch, `xray-ctl` checks the running SOCKS path; if no test site works, it
+capped by `--timeout` (8 seconds by default). After the connectivity checks,
+`best` and `country` compare speed for at most four responsive profiles with
+the best site coverage and comparable latency. These bounded 512 KiB tests run
+in parallel and take at most four seconds of download time each. A speed test
+failure never marks a working profile as dead; a measured gain must exceed 30%
+to change the latency-based choice or an already healthy selection. `status`
+still measures live download speed separately. After a switch, `xray-ctl`
+checks the running SOCKS path; if no test site works, it
 restores the previous configuration and restarts the previous connection. If
 the already-running server and generated configuration are unchanged, `best`
 keeps that connection instead of restarting it.

@@ -26,8 +26,10 @@ TEST_URLS = (
 )
 DEFAULT_WORKERS = min(32, max(16, (os.cpu_count() or 8)*2))
 DEFAULT_PROBE_TIMEOUT = 8
+SPEED_CANDIDATES = 4
+SPEED_GAIN_THRESHOLD = 1.3
 COLOR = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 
 def paint(code,text): return f"\033[{code}m{text}\033[0m" if COLOR else text
 
@@ -427,7 +429,8 @@ def probe_score(values):
     ordered=sorted(value for value in values if value is not None)
     if not ordered: return None
     return round((ordered[(len(ordered)-1)//2]+ordered[len(ordered)//2])/2,1)
-def test(n,timeout,interface=None,urls=TEST_URLS):
+@contextlib.contextmanager
+def node_proxy(n,interface=None):
     p=port()
     with tempfile.TemporaryDirectory(prefix='blancctl-') as d:
         c=pathlib.Path(d)/'c.json'; c.write_text(json.dumps(socks(n,p,interface)))
@@ -435,20 +438,27 @@ def test(n,timeout,interface=None,urls=TEST_URLS):
         try:
             end=time.monotonic()+2.5
             while time.monotonic()<end:
-                if x.poll() is not None: return n['id'],None,[None]*len(urls)
+                if x.poll() is not None:
+                    yield None
+                    return
                 try:
                     with socket.create_connection(('127.0.0.1',p),.15): break
                 except OSError: time.sleep(.05)
-            else: return n['id'],None,[None]*len(urls)
-            proxy=f'socks5h://127.0.0.1:{p}'
-            values=probe_urls(proxy,urls,timeout)
-            return n['id'],probe_score(values),values
+            else:
+                yield None
+                return
+            yield f'socks5h://127.0.0.1:{p}'
         finally:
             if x.poll() is None:
                 x.terminate()
                 try: x.wait(1)
                 except subprocess.TimeoutExpired:
                     x.kill(); x.wait()
+def test(n,timeout,interface=None,urls=TEST_URLS):
+    with node_proxy(n,interface) as proxy:
+        if proxy is None: return n['id'],None,[None]*len(urls)
+        values=probe_urls(proxy,urls,timeout)
+        return n['id'],probe_score(values),values
 def benchmark(ns,workers,timeout):
     if not ns: return {}
     if not math.isfinite(timeout) or timeout<=0: die("probe timeout must be a positive finite number")
@@ -506,6 +516,54 @@ def speedtest(timeout=20):
         downloaded,elapsed=map(float,r.stdout.split())
         return round(downloaded*8/elapsed/1_000_000,1) if downloaded and elapsed else None
     except (ValueError,ZeroDivisionError): return None
+def speedtest_node(n,timeout,interface=None):
+    size=512*1024
+    with node_proxy(n,interface) as proxy:
+        if proxy is None: return None
+        try:
+            r=subprocess.run(['curl','-sS','-L','--max-redirs','2','--range',f'0-{size-1}',
+              '-o','/dev/null','--proxy',proxy,'--noproxy','',
+              '--connect-timeout',str(min(timeout,2.5)),'--max-time',str(timeout),
+              '-w','%{size_download} %{time_total} %{time_starttransfer} %{http_code}',
+              f'https://speed.cloudflare.com/__down?bytes={size}'],
+              capture_output=True,text=True,timeout=timeout+2)
+        except (OSError,subprocess.TimeoutExpired): return None
+        try:
+            downloaded,elapsed,first_byte,status=map(float,r.stdout.split())
+            transfer=elapsed-first_byte
+            if r.returncode not in (0,28) or not 200<=status<400 or downloaded<65536 or transfer<=0:
+                return None
+            return round(downloaded*8/transfer/1_000_000,1)
+        except (ValueError,ZeroDivisionError): return None
+def comparable_latency(latency,fastest):
+    return latency<=fastest*1.25+100
+def benchmark_speeds(ns,pings,sites,selected_id,workers,timeout):
+    working=[n for n in ns if pings.get(n['id']) is not None]
+    if len(working)<2: return {}
+    coverage=max(sum(sites.get(n['id'],[])) for n in working)
+    eligible=[n for n in working if sum(sites.get(n['id'],[]))==coverage]
+    fastest=min(pings[n['id']] for n in eligible)
+    comparable=sorted((n for n in eligible if comparable_latency(pings[n['id']],fastest)),
+                      key=lambda n:pings[n['id']])
+    shortlisted=comparable[:SPEED_CANDIDATES]
+    selected=next((n for n in comparable if n['id']==selected_id),None)
+    if selected and selected not in shortlisted:
+        shortlisted[-1]=selected
+    if len(shortlisted)<2: return {}
+    limit=min(timeout,4.0)
+    interface=physical_interface()
+    print(f"Comparing speed for {len(shortlisted)} responsive profiles (up to {limit:g} seconds each)…")
+    speeds={}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,min(workers,len(shortlisted)))) as pool:
+        futures={pool.submit(speedtest_node,n,limit,interface):n for n in shortlisted}
+        for future in concurrent.futures.as_completed(futures):
+            n=futures[future]
+            try: speed=future.result()
+            except Exception: speed=None
+            if speed is not None: speeds[n['id']]=speed
+            print(f"  {n['label']}: {speed:.1f} Mbps" if speed is not None else
+                  f"  {n['label']}: speed unavailable")
+    return speeds
 def pingtest(timeout=10):
     successful=[value for value in probe_urls(LOCAL_PROXY,TEST_URLS,timeout) if value is not None]
     return round(min(successful),1) if successful else None
@@ -633,13 +691,27 @@ def failover(_):
     print("Failover could not find a working cached server; will retry later.")
 def record_speed():
     stats=load(STATS,{}); stats['speed_mbps']=speedtest(); stats['tested_at']=int(time.time()); save(STATS,stats)
-def best(ns,r,sites,selected_id=None):
+def best(ns,r,sites,selected_id=None,speeds=None):
     ok=[n for n in ns if r.get(n['id']) is not None]
     if not ok: die("no working server found")
     count=lambda n: sum(sites.get(n['id'],[]))
-    winner=min(ok,key=lambda n:(-count(n),r[n['id']]))
-    current=next((n for n in ok if n['id']==selected_id),None)
-    if current and count(current)==count(winner) and r[current['id']]<=r[winner['id']]*1.25+100:
+    coverage=max(count(n) for n in ok)
+    eligible=[n for n in ok if count(n)==coverage]
+    baseline=min(eligible,key=lambda n:r[n['id']])
+    winner=baseline
+    speeds=speeds or {}
+    if speeds.get(baseline['id']) is not None:
+        measured=[n for n in eligible if comparable_latency(r[n['id']],r[baseline['id']])
+                  and speeds.get(n['id']) is not None]
+        if measured:
+            fastest=max(measured,key=lambda n:speeds[n['id']])
+            if speeds[fastest['id']]>speeds[baseline['id']]*SPEED_GAIN_THRESHOLD:
+                winner=fastest
+    current=next((n for n in eligible if n['id']==selected_id),None)
+    if current and comparable_latency(r[current['id']],r[baseline['id']]):
+        if speeds.get(current['id']) is not None and speeds.get(winner['id']) is not None \
+           and speeds[winner['id']]>speeds[current['id']]*SPEED_GAIN_THRESHOLD:
+            return winner
         return current
     return winner
 def benchmark_choice(ns,workers,timeout,fallback=()):
@@ -648,7 +720,9 @@ def benchmark_choice(ns,workers,timeout,fallback=()):
         print(f"No current profile worked; checking {len(fallback)} retained backups…")
         ns=list(fallback)
         r,sites=benchmark(ns,workers,timeout)
-    return best(ns,r,sites,load(PICK,{}).get('id')),r
+    selected_id=load(PICK,{}).get('id')
+    speeds=benchmark_speeds(ns,r,sites,selected_id,workers,timeout)
+    return best(ns,r,sites,selected_id,speeds),r
 def service(action):
     if os.getenv('BLANCCTL_NO_SERVICE')=='1': return
     owner=configured_owner(); user=current_user()

@@ -1,7 +1,7 @@
 # Release package for the Arch User Repository. Replace @ARCHIVE_SHA256@
-# with the checksum of the published v0.6.1 source archive before submission.
+# with the checksum of the published v0.6.2 source archive before submission.
 pkgname=xray-ctl
-pkgver=0.6.1
+pkgver=0.6.2
 pkgrel=1
 pkgdesc='Xray TUN manager with multiple VLESS subscriptions and split tunneling'
 arch=('any')

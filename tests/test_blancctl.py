@@ -244,7 +244,7 @@ class NodeCacheTests(unittest.TestCase):
                 self.assertIn('trojan://unsupported', blancctl.RAW.read_text())
                 self.assertEqual(blancctl.RAW.stat().st_mode & 0o777, 0o600)
 
-    def test_best_uses_cache_without_updating_or_speedtest(self):
+    def test_best_uses_cache_without_a_separate_live_speedtest(self):
         node = sample('Extra, Germany', 'a.example')
         args = argparse.Namespace(refresh=False, workers=2, timeout=8)
         with mock.patch.object(blancctl, 'cached_nodes', return_value=([node], [])), \
@@ -534,6 +534,79 @@ class NodeCacheTests(unittest.TestCase):
         self.assertIs(blancctl.best([a,b],{a['id']:50,b['id']:None},sites),a)
         sites[a['id']]=[True]*4
         self.assertIs(blancctl.best([a,b],{a['id']:110,b['id']:100},sites,a['id']),a)
+
+    def test_best_uses_speed_only_for_comparable_responsive_nodes(self):
+        a=sample('Low ping', 'a.example')
+        b=sample('Fast download', 'b.example'); b['id']='node-002'
+        coverage={a['id']:[True]*4,b['id']:[True]*4}
+        pings={a['id']:100,b['id']:120}
+        self.assertIs(blancctl.best([a,b],pings,coverage,speeds={a['id']:10,b['id']:20}),b)
+        self.assertIs(blancctl.best([a,b],pings,coverage,a['id'],{a['id']:10,b['id']:20}),b)
+        self.assertIs(blancctl.best([a,b],pings,coverage,a['id'],{a['id']:10,b['id']:12}),a)
+        self.assertIs(blancctl.best([a,b],pings,coverage,speeds={b['id']:100}),a)
+        coverage[b['id']]=[True,False,False,False]
+        self.assertIs(blancctl.best([a,b],pings,coverage,speeds={a['id']:10,b['id']:100}),a)
+        coverage[b['id']]=[True]*4
+        pings[b['id']]=500
+        self.assertIs(blancctl.best([a,b],pings,coverage,speeds={a['id']:10,b['id']:100}),a)
+
+    def test_speed_stage_only_checks_nearby_working_profiles_in_parallel(self):
+        a=sample('A', 'a.example')
+        b=sample('B', 'b.example'); b['id']='node-002'
+        failed=sample('Failed', 'c.example'); failed['id']='node-003'
+        partial=sample('Partial', 'd.example'); partial['id']='node-004'
+        pings={a['id']:100,b['id']:120,failed['id']:None,partial['id']:50}
+        sites={a['id']:[True]*4,b['id']:[True]*4,partial['id']:[True,False,False,False]}
+        barrier=threading.Barrier(2)
+        def measure(node, timeout, interface):
+            barrier.wait(timeout=2)
+            self.assertEqual((timeout,interface),(4.0,'wlan0'))
+            return 10 if node is a else 20
+        with mock.patch.object(blancctl,'physical_interface',return_value='wlan0'), \
+             mock.patch.object(blancctl,'speedtest_node',side_effect=measure) as speedtest, \
+             contextlib.redirect_stdout(io.StringIO()):
+            speeds=blancctl.benchmark_speeds([a,b,failed,partial],pings,sites,None,4,8)
+        self.assertEqual(speeds,{a['id']:10,b['id']:20})
+        self.assertEqual(speedtest.call_count,2)
+
+    def test_speed_stage_skips_when_there_is_nothing_to_compare(self):
+        working=sample('Working','a.example')
+        failed=sample('Failed','b.example'); failed['id']='node-002'
+        with mock.patch.object(blancctl,'speedtest_node') as speedtest:
+            speeds=blancctl.benchmark_speeds([working,failed],
+              {working['id']:100,failed['id']:None},{working['id']:[True]*4},None,4,8)
+        self.assertEqual(speeds,{})
+        speedtest.assert_not_called()
+
+    def test_benchmark_choice_checks_ping_before_speed(self):
+        a=sample('A','a.example')
+        b=sample('B','b.example'); b['id']='node-002'
+        events=[]
+        def ping(*_):
+            events.append('ping')
+            return {a['id']:100,b['id']:120},{a['id']:[True]*4,b['id']:[True]*4}
+        def speed(*_):
+            events.append('speed')
+            return {a['id']:10,b['id']:20}
+        with mock.patch.object(blancctl,'benchmark',side_effect=ping), \
+             mock.patch.object(blancctl,'benchmark_speeds',side_effect=speed), \
+             mock.patch.object(blancctl,'load',return_value={}):
+            winner,_=blancctl.benchmark_choice([a,b],4,8)
+        self.assertEqual(events,['ping','speed'])
+        self.assertIs(winner,b)
+
+    def test_node_speed_test_accepts_partial_download_but_not_failed_endpoint(self):
+        node=sample('Working','a.example')
+        with mock.patch.object(blancctl,'node_proxy',return_value=contextlib.nullcontext('socks5h://127.0.0.1:1234')), \
+             mock.patch.object(blancctl.subprocess,'run',return_value=subprocess.CompletedProcess(
+                 [],28,stdout='131072 4.0 0.5 200')) as curl:
+            speed=blancctl.speedtest_node(node,4,'wlan0')
+        self.assertEqual(speed,0.3)
+        self.assertIn('--proxy',curl.call_args.args[0])
+        with mock.patch.object(blancctl,'node_proxy',return_value=contextlib.nullcontext('socks5h://127.0.0.1:1234')), \
+             mock.patch.object(blancctl.subprocess,'run',return_value=subprocess.CompletedProcess(
+                 [],0,stdout='524288 1.0 0.5 503')):
+            self.assertIsNone(blancctl.speedtest_node(node,4,'wlan0'))
 
     def test_failed_new_subscription_keeps_existing_cache_and_url(self):
         with tempfile.TemporaryDirectory() as tmp:
