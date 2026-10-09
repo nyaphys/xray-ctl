@@ -1,6 +1,6 @@
 pkgbase = xray-ctl
 	pkgdesc = Xray TUN manager with multiple VLESS subscriptions and split tunneling
-	pkgver = 0.6.3
+	pkgver = 0.6.4
 	pkgrel = 1
 	arch = any
 	license = MIT

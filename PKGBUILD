@@ -1,5 +1,5 @@
 pkgname=xray-ctl
-pkgver=0.6.3
+pkgver=0.6.4
 pkgrel=1
 pkgdesc='Xray TUN manager with multiple VLESS subscriptions and split tunneling'
 arch=('any')

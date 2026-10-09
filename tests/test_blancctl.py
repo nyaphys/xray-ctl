@@ -1,12 +1,15 @@
 import argparse
 import contextlib
+import http.server
 import io
 import pathlib
 import json
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from unittest import mock
@@ -93,18 +96,19 @@ class NodeCacheTests(unittest.TestCase):
                 self.assertEqual(blancctl.load(blancctl.NODES, []), [old])
                 self.assertIn('trojan://unsupported', blancctl.RAW.read_text())
 
-    def test_route_defaults_proxy_and_explicit_direct_rules_only(self):
+    def test_route_defaults_proxy_and_verified_direct_exception(self):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(blancctl, 'ROUTES', pathlib.Path(tmp)/'routing.json'):
             config = blancctl.routing_config()
             self.assertEqual(config['default'], 'proxy')
-            self.assertEqual(config['direct']['domains'], [])
+            self.assertEqual(config['direct']['domains'], ['domain:cldom.ru'])
             self.assertEqual(blancctl.routing_rules()[-1]['outboundTag'], 'proxy')
             blancctl.save(blancctl.ROUTES, {'default':'proxy',
                          'direct':{'domains':['example.ru', 'full:sub.example.ru'],
                                    'ips':['192.0.2.3']}})
             rules = blancctl.routing_rules()
-            self.assertEqual(rules[-3]['domain'], ['domain:example.ru', 'full:sub.example.ru'])
+            self.assertEqual(rules[-3]['domain'],
+                             ['domain:example.ru', 'full:sub.example.ru', 'domain:cldom.ru'])
             self.assertEqual(rules[-1]['outboundTag'], 'proxy')
             self.assertNotIn('geoip:ru', str(rules))
 
@@ -168,10 +172,125 @@ class NodeCacheTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             blancctl.route(argparse.Namespace(args=['add','direct','domain','example.ru']))
             self.assertEqual(blancctl.routing_config()['direct']['domains'],
-                             ['domain:example.ru'])
+                             ['domain:cldom.ru', 'domain:example.ru'])
             blancctl.route(argparse.Namespace(args=['remove','direct','domain','example.ru']))
-            self.assertEqual(blancctl.routing_config()['direct']['domains'], [])
+            self.assertEqual(blancctl.routing_config()['direct']['domains'], ['domain:cldom.ru'])
             select.assert_not_called()
+
+    def test_verified_default_can_be_removed_and_restored(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(blancctl, 'ROUTES', pathlib.Path(tmp)/'routing.json'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            blancctl.route(argparse.Namespace(args=['remove','direct','domain','cldom.ru']))
+            self.assertEqual(blancctl.routing_config()['direct']['domains'], [])
+            self.assertEqual(blancctl.routing_config()['disabled_defaults'], ['domain:cldom.ru'])
+            blancctl.route(argparse.Namespace(args=['add','direct','domain','cldom.ru']))
+            self.assertEqual(blancctl.routing_config()['direct']['domains'], ['domain:cldom.ru'])
+            self.assertEqual(blancctl.routing_config()['disabled_defaults'], [])
+
+    def test_user_proxy_rule_precedes_verified_direct_default(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(blancctl, 'ROUTES', pathlib.Path(tmp)/'routing.json'):
+            blancctl.save(blancctl.ROUTES, {'proxy':{'domains':['cldom.ru']}})
+            rules=blancctl.routing_rules()
+            proxy_at=next(i for i, rule in enumerate(rules) if rule.get('outboundTag')=='proxy'
+                          and 'domain:cldom.ru' in rule.get('domain',[]))
+            direct_at=next(i for i, rule in enumerate(rules) if rule.get('outboundTag')=='direct'
+                           and 'domain:cldom.ru' in rule.get('domain',[]))
+            self.assertLess(proxy_at,direct_at)
+
+    def test_domain_route_matches_subdomains_and_higher_priority_rules(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(blancctl, 'ROUTES', pathlib.Path(tmp)/'routing.json'):
+            blancctl.save(blancctl.ROUTES, {'block':{'domains':['full:login.cldom.ru']},
+                                           'proxy':{'domains':['full:private.cldom.ru']}})
+            config=blancctl.routing_config()
+            self.assertEqual(blancctl.domain_route('cldom.ru',config),
+                             ('direct','domain:cldom.ru'))
+            self.assertEqual(blancctl.domain_route('www.cldom.ru',config),
+                             ('direct','domain:cldom.ru'))
+            self.assertEqual(blancctl.domain_route('login.cldom.ru',config),
+                             ('block','full:login.cldom.ru'))
+            self.assertEqual(blancctl.domain_route('private.cldom.ru',config),
+                             ('proxy','full:private.cldom.ru'))
+            self.assertEqual(blancctl.domain_route('other.example',config),
+                             ('proxy','default'))
+
+    def test_route_test_uses_three_bounded_parallel_paths_without_changing_config(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(blancctl, 'ROUTES', pathlib.Path(tmp)/'routing.json'), \
+             mock.patch.object(blancctl, 'physical_interface', return_value='wlan0'), \
+             mock.patch.object(blancctl, 'route_probe', return_value='HTTP 200 in 0.1 s') as probe, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            blancctl.route(argparse.Namespace(args=['test','cldom.ru']))
+        self.assertEqual(probe.call_count,3)
+        self.assertIn('Domain rule: direct',output.getvalue())
+        self.assertIn('physical: HTTP 200',output.getvalue())
+        self.assertIn('tun: HTTP 200',output.getvalue())
+        self.assertIn('socks: HTTP 200',output.getvalue())
+
+    def test_route_probe_does_not_follow_redirects_or_log_target(self):
+        response=subprocess.CompletedProcess([],0,stdout='301 0.123',stderr='')
+        with mock.patch.object(blancctl.subprocess,'run',return_value=response) as run:
+            self.assertEqual(blancctl.route_probe('https://cldom.ru/','physical','wlan0'),
+                             'HTTP 301 in 0.123 s')
+        command=run.call_args.args[0]
+        self.assertIn('--max-redirs',command)
+        self.assertIn('--interface',command)
+        self.assertIn('--noproxy',command)
+
+    @unittest.skipUnless(shutil.which('xray') and shutil.which('curl'),
+                         'Xray and curl are required')
+    def test_xray_sniffed_domain_uses_direct_without_changing_original_ip(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'direct-route-ok')
+            def log_message(self,*_): pass
+        try: server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+        except PermissionError: self.skipTest('local sockets are blocked by the sandbox')
+        thread=threading.Thread(target=server.serve_forever,daemon=True)
+        thread.start()
+        proxy_port=blancctl.port()
+        config={'log':{'loglevel':'none'},
+                'inbounds':[{'listen':'127.0.0.1','port':proxy_port,'protocol':'socks',
+                             'settings':{'udp':True},
+                             'sniffing':{'enabled':True,'destOverride':['http','tls','quic'],
+                                         'routeOnly':True}}],
+                'outbounds':[{'tag':'direct','protocol':'freedom'},
+                             {'tag':'block','protocol':'blackhole'}],
+                'routing':{'domainStrategy':'AsIs','rules':[
+                    {'type':'field','domain':['full:localhost'],'outboundTag':'direct'},
+                    {'type':'field','network':'tcp,udp','outboundTag':'block'}]}}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path=pathlib.Path(tmp)/'xray.json'
+                path.write_text(json.dumps(config))
+                process=subprocess.Popen(['xray','run','-c',str(path)],
+                                         stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+                try:
+                    for _ in range(50):
+                        try:
+                            with socket.create_connection(('127.0.0.1',proxy_port),0.1): break
+                        except OSError: time.sleep(0.05)
+                    else: self.fail('Xray SOCKS listener did not start')
+                    result=subprocess.run(['curl','--silent','--show-error','--noproxy','',
+                                           '--proxy',f'socks5://127.0.0.1:{proxy_port}',
+                                           '--header','Host: localhost','--max-time','3',
+                                           f'http://127.0.0.1:{server.server_port}/'],
+                                          capture_output=True,text=True,timeout=4)
+                    self.assertEqual(result.returncode,0,result.stderr)
+                    self.assertEqual(result.stdout,'direct-route-ok')
+                finally:
+                    process.terminate()
+                    try: process.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=2)
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_nixos_sudo_wrapper_takes_priority_over_store_binary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -661,6 +780,7 @@ class NodeCacheTests(unittest.TestCase):
         self.assertNotIn('mux', config['outbounds'][0])
         self.assertTrue(config['inbounds'][0]['sniffing']['enabled'])
         self.assertTrue(config['inbounds'][0]['sniffing']['routeOnly'])
+        self.assertEqual(config['inbounds'][1]['sniffing'], config['inbounds'][0]['sniffing'])
         self.assertEqual(config['routing']['rules'][0]['ip'], ['geoip:private'])
         self.assertNotIn('geoip:ru', str(config['routing']))
         self.assertNotIn('ru|xn--p1ai', str(config['routing']))

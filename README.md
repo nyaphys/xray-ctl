@@ -145,9 +145,14 @@ uses the cache first for speed, then refreshes in the background.
 The default is proxy for all public destinations. Add only Russian sites that
 you have confirmed work directly; there is deliberately no blanket `.ru` or
 Russian-IP bypass, because some Russian sites still need the VPN.
+Version 0.6.4 includes one direct exception verified on the reported network:
+`cldom.ru` and its subdomains. Explicit `proxy` or `block` rules still take
+precedence. Disable this default with `xray-ctl route remove direct domain
+cldom.ru`; restore it with `xray-ctl route add direct domain cldom.ru`.
 
 ```console
 xray-ctl route show
+xray-ctl route test cldom.ru
 xray-ctl route add direct domain example.ru
 xray-ctl route add direct domain full:login.example.ru
 xray-ctl route add direct ip 203.0.113.0/24
@@ -164,8 +169,12 @@ traffic, block rules have highest priority, followed by proxy and direct
 rules, then the default. `route default direct` reverses the default for specialized setups;
 `route default proxy` restores the recommended mode. Local/private networks
 remain direct at the kernel and Xray layers.
+`route test DOMAIN` compares physical, TUN, and SOCKS HTTPS paths concurrently
+without editing configuration. It shows domain-rule intent but cannot prove
+which IP/geosite rule Xray applied, and does not test browser subresources or QUIC.
 
-Domain rules rely on Xray sniffing HTTP, TLS, and QUIC hostnames; applications
+Domain rules rely on Xray sniffing HTTP, TLS, and QUIC hostnames on both TUN
+and the local SOCKS inbound; applications
 that hide the hostname or connect by IP may need an IP rule. Be careful with
 direct IP ranges: other websites on shared hosting/CDNs may use them. `route
 apply` validates and restarts the selected service, reverting the live Xray

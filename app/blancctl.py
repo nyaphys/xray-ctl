@@ -30,7 +30,8 @@ DEFAULT_PROBE_TIMEOUT = 8
 SPEED_CANDIDATES = 4
 SPEED_GAIN_THRESHOLD = 1.3
 COLOR = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
-VERSION = "0.6.3"
+VERSION = "0.6.4"
+DEFAULT_DIRECT_DOMAINS = ('domain:cldom.ru',)
 LOG_LIMIT = 2 * 1024 * 1024
 LOG_BACKUPS = 4
 
@@ -423,10 +424,16 @@ def normalize_route_value(kind,value):
 def routing_config():
     raw=load(ROUTES,{})
     if not isinstance(raw,dict): die("routing.json must be an object")
-    if set(raw)-{'default','direct','proxy','block'}: die("unknown routing.json key")
+    if set(raw)-{'default','direct','proxy','block','disabled_defaults'}: die("unknown routing.json key")
     default=raw.get('default','proxy')
     if default not in ('proxy','direct'): die("routing default must be proxy or direct")
-    result={'default':default}
+    disabled=raw.get('disabled_defaults',[])
+    if not isinstance(disabled,list) or any(not isinstance(v,str) for v in disabled):
+        die("invalid disabled routing defaults")
+    disabled=list(dict.fromkeys(normalize_route_value('domains',v) for v in disabled))
+    if any(v not in DEFAULT_DIRECT_DOMAINS for v in disabled):
+        die("unknown disabled routing default")
+    result={'default':default,'disabled_defaults':disabled}
     for action in ('direct','proxy','block'):
         group=raw.get(action,{})
         if not isinstance(group,dict) or set(group)-{'domains','ips'}:
@@ -437,6 +444,9 @@ def routing_config():
             if not isinstance(values,list) or len(values)>500 or any(not isinstance(v,str) for v in values):
                 die(f"invalid routing {action} {kind}")
             result[action][kind]=list(dict.fromkeys(normalize_route_value(kind,v) for v in values))
+    result['direct']['domains']=list(dict.fromkeys(
+        [v for v in result['direct']['domains'] if v not in disabled]
+        +[v for v in DEFAULT_DIRECT_DOMAINS if v not in disabled]))
     return result
 def routing_rules():
     config=routing_config()
@@ -448,13 +458,50 @@ def routing_rules():
                                      'outboundTag':action})
     rules.append({'type':'field','network':'tcp,udp','outboundTag':config['default']})
     return rules
+def domain_route(domain,config):
+    """Explain domain-only rules; IP/geosite rules need Xray to decide."""
+    for action in ('block','proxy','direct'):
+        for value in config[action]['domains']:
+            if value.startswith('full:') and domain==value[5:]: return action,value
+            if value.startswith('domain:') and (domain==value[7:] or domain.endswith('.'+value[7:])):
+                return action,value
+    return config['default'],'default'
+def route_probe(url,path,interface=None):
+    command=['curl','--silent','--show-error','--output','/dev/null','--max-redirs','0',
+             '--connect-timeout','3','--max-time','6','--write-out','%{http_code} %{time_total}']
+    if interface: command.extend(('--interface',interface))
+    if path=='socks': command.extend(('--noproxy','','--proxy',LOCAL_PROXY))
+    else: command.extend(('--noproxy','*'))
+    try:
+        result=subprocess.run(command+[url],capture_output=True,text=True,timeout=7)
+    except subprocess.TimeoutExpired:
+        return 'timeout'
+    if result.returncode: return f'failed (curl {result.returncode})'
+    parts=result.stdout.strip().split()
+    if len(parts)!=2: return 'unreadable curl result'
+    return f'HTTP {parts[0]} in {parts[1]} s'
+def diagnose_route(domain):
+    normalized=normalize_route_value('domains',domain)
+    if normalized.startswith('geosite:'): die('route test requires a hostname')
+    host=normalized.split(':',1)[1]
+    action,rule=domain_route(host,routing_config())
+    print(f'Domain rule: {action} ({rule}); IP/geosite rules may take precedence in Xray.')
+    interface=physical_interface()
+    url='https://'+host+'/'
+    paths={'physical':interface,'tun':None,'socks':None}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        jobs={name:pool.submit(route_probe,url,name,device) for name,device in paths.items()}
+        for name,job in jobs.items(): print(f'{name}: {job.result()}')
+    print('These HTTP probes do not test browser subresources, QUIC, or a hidden SNI.')
 def tun(n):
     interface=physical_interface(); direct={'tag':'direct','protocol':'freedom','streamSettings':{'sockopt':{'interface':interface}}}
+    sniffing={'enabled':True,'destOverride':['http','tls','quic'],'routeOnly':True}
     return {'log':{'loglevel':'warning'},'dns':{'servers':['1.1.1.1','8.8.8.8','localhost']},
       'inbounds':[{'tag':'tun-in','protocol':'tun','settings':{'name':'blanc0','mtu':1400,
        'gateway':['172.30.0.1/30','fd30::1/126']},
-       'sniffing':{'enabled':True,'destOverride':['http','tls','quic'],'routeOnly':True}},
-       {'tag':'socks-in','listen':'127.0.0.1','port':10808,'protocol':'socks','settings':{'udp':True}}],
+       'sniffing':sniffing},
+       {'tag':'socks-in','listen':'127.0.0.1','port':10808,'protocol':'socks','settings':{'udp':True},
+        'sniffing':sniffing}],
       'outbounds':[outbound(n,interface),direct,{'tag':'block','protocol':'blackhole'}],
       'routing':{'domainStrategy':'AsIs','rules':routing_rules()}}
 def socks(n,port,interface=None):
@@ -1090,6 +1137,9 @@ def route(a):
     if parts==['show']:
         print(json.dumps(routing_config(),ensure_ascii=False,indent=2))
         return
+    if len(parts)==2 and parts[0]=='test':
+        diagnose_route(parts[1])
+        return
     if len(parts)==2 and parts[0]=='default':
         if parts[1] not in ('proxy','direct'): die("route default must be proxy or direct")
         config=routing_config(); config['default']=parts[1]
@@ -1103,8 +1153,14 @@ def route(a):
         config=routing_config()
         values=config[action]['domains' if kind=='domain' else 'ips']
         value=normalize_route_value('domains' if kind=='domain' else 'ips',parts[3])
-        if parts[0]=='add' and value not in values: values.append(value)
-        if parts[0]=='remove' and value in values: values.remove(value)
+        if parts[0]=='add':
+            if value not in values: values.append(value)
+            if action=='direct' and value in config['disabled_defaults']:
+                config['disabled_defaults'].remove(value)
+        if parts[0]=='remove':
+            if value in values: values.remove(value)
+            if action=='direct' and value in DEFAULT_DIRECT_DOMAINS and value not in config['disabled_defaults']:
+                config['disabled_defaults'].append(value)
         save(ROUTES,config)
         print("Routing rule saved; run: xray-ctl route apply")
         return
@@ -1115,7 +1171,7 @@ def route(a):
         if node is None: die("selected profile is not cached; run: xray-ctl best")
         select(node,force=True)
         return
-    die("use: xray-ctl route show|default proxy|direct|add ACTION domain|ip VALUE|remove ACTION domain|ip VALUE|apply")
+    die("use: xray-ctl route show|test DOMAIN|default proxy|direct|add ACTION domain|ip VALUE|remove ACTION domain|ip VALUE|apply")
 def status(_):
     active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
     pick=load(PICK,{}); stats=load(STATS,{})
