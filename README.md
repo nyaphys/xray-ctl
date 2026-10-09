@@ -105,7 +105,9 @@ xray-ctl best             test cached servers, select one, then refresh in backg
 xray-ctl best --refresh   refresh first, then select
 xray-ctl update-status    show the last background refresh result
 xray-ctl status           live VPN, country, ping, and speed check
-xray-ctl log              show the latest detailed service log
+xray-ctl log              show recent private diagnostic events (JSON lines)
+xray-ctl log --lines 500  show more events, including rotated history
+xray-ctl log --service    show Xray and failover systemd journal
 xray-ctl proxy            show the local SOCKS5 proxy address
 xray-ctl stop             stop the TUN
 xray-ctl doctor           verify ownership, dependencies, service access, and shell proxy state
@@ -265,6 +267,19 @@ of zero packet loss or a kill switch.
 The defaults can be overridden in the failover service environment with
 `BLANCCTL_FAILOVER_FAILURES`, `BLANCCTL_FAILOVER_TIMEOUT`, and
 `BLANCCTL_FAILOVER_CANDIDATES`.
+
+Commands, subscription refreshes, node probes, live four-site checks, service
+restarts, route repairs, failover decisions, and unexpected exceptions are
+recorded automatically in `/var/lib/blancctl/events.jsonl`. The journal is
+private (`0600`) and rotates at 2 MiB, retaining four older files (about
+10 MiB total). Events use UTC timestamps, profile IDs and hashed subscription
+names; subscription URLs, VLESS credentials, raw server addresses, and node
+labels are not logged there. `xray-ctl log` shows the latest 100 events and
+`--lines N` can read the rotated history. Xray's own startup and runtime
+messages, plus timer output, remain in systemd's journal and can be read with
+`xray-ctl log --service`. Whether older systemd entries survive reboot depends
+on the host's journald configuration. Diagnostic files should still be treated
+as private when sharing them for troubleshooting.
 
 `start` always enables persistent boot startup, rebuilds the selected
 configuration, and performs a clean service restart, including stale failure

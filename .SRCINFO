@@ -1,0 +1,16 @@
+pkgbase = xray-ctl
+	pkgdesc = Xray TUN manager with multiple VLESS subscriptions and split tunneling
+	pkgver = 0.6.3
+	pkgrel = 1
+	arch = any
+	license = MIT
+	depends = python
+	depends = curl
+	depends = xray
+	depends = sudo
+	depends = iproute2
+	provides = blancctl
+	conflicts = blancctl
+	replaces = blancctl
+
+pkgname = xray-ctl

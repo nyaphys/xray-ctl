@@ -29,11 +29,7 @@ case "${1:-}" in
         exec /usr/bin/systemctl --no-pager --full status blancctl.service
         ;;
     log)
-        invocation="$(/usr/bin/systemctl show blancctl.service -p InvocationID --value)"
-        if [[ -n "$invocation" ]]; then
-            exec /usr/bin/journalctl "_SYSTEMD_INVOCATION_ID=$invocation" -n 100 --no-pager --output=short-precise
-        fi
-        exec /usr/bin/journalctl -u blancctl.service -n 100 --no-pager --output=short-precise
+        exec /usr/bin/journalctl -u blancctl.service -u blancctl-failover.service -n 200 --no-pager --output=short-precise
         ;;
     *)
         echo "usage: service-control {check|start|stop|restart|status|log}" >&2

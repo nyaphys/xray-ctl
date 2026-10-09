@@ -2,6 +2,7 @@
 """xray-ctl VLESS subscription manager for Xray TUN."""
 import argparse, base64, concurrent.futures, contextlib, fcntl, hashlib, io, json, math, os, pathlib, pwd, socket
 import ipaddress, re, shutil, subprocess, sys, tempfile, time, urllib.parse
+import collections, inspect, threading, traceback
 
 STATE = pathlib.Path(os.getenv("BLANCCTL_STATE", "/var/lib/blancctl"))
 SUB, NODES, PINGS, PICK, CONF, STATS, FAILOVER = [STATE / n for n in
@@ -29,11 +30,56 @@ DEFAULT_PROBE_TIMEOUT = 8
 SPEED_CANDIDATES = 4
 SPEED_GAIN_THRESHOLD = 1.3
 COLOR = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
-VERSION = "0.6.2"
+VERSION = "0.6.3"
+LOG_LIMIT = 2 * 1024 * 1024
+LOG_BACKUPS = 4
 
 def paint(code,text): return f"\033[{code}m{text}\033[0m" if COLOR else text
 
-def die(s): print("xray-ctl:", s, file=sys.stderr); raise SystemExit(1)
+def diagnostic_log_path(): return STATE / 'events.jsonl'
+def log_event(event, **fields):
+    """Append a bounded, private diagnostic record without raw URLs or profiles."""
+    record={'time':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+            'pid':os.getpid(),'thread':threading.get_native_id(),'event':event}
+    for key,value in fields.items():
+        if isinstance(value,(bool,int,float)) or value is None:
+            record[key]=value
+        elif isinstance(value,str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,80}',value):
+            record[key]=value
+        else:
+            record[key]='redacted'
+    try:
+        STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
+        with (STATE/'events.lock').open('a+') as lock:
+            os.chmod(lock.name,0o600)
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            path=diagnostic_log_path()
+            line=json.dumps(record,ensure_ascii=True,separators=(',',':'))+'\n'
+            if path.exists() and path.stat().st_size+len(line.encode())>LOG_LIMIT:
+                for number in range(LOG_BACKUPS,1,-1):
+                    old=path.with_name(f'{path.name}.{number-1}')
+                    if old.exists(): os.replace(old,path.with_name(f'{path.name}.{number}'))
+                os.replace(path,path.with_name(f'{path.name}.1'))
+            fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
+            with os.fdopen(fd,'a') as stream:
+                os.fchmod(stream.fileno(),0o600)
+                stream.write(line)
+    except OSError as exc:
+        print(f'xray-ctl: diagnostic logging unavailable ({type(exc).__name__})',file=sys.stderr)
+
+def log_exception(event,exc,**fields):
+    frames=traceback.extract_tb(exc.__traceback__)
+    last=frames[-1] if frames else None
+    log_event(event,error_type=type(exc).__name__,
+              location=f'{last.name}:{last.lineno}' if last else 'unknown',**fields)
+
+def source_log_id(name): return hashlib.sha256(name.encode()).hexdigest()[:12]
+
+def die(s):
+    caller=inspect.currentframe().f_back
+    log_event('failure',location=f'{caller.f_code.co_name}:{caller.f_lineno}')
+    print('xray-ctl:',s,file=sys.stderr)
+    raise SystemExit(1)
 def current_user(): return pwd.getpwuid(os.geteuid()).pw_name
 def sudo_executable(wrapper=pathlib.Path('/run/wrappers/bin/sudo')):
     """Prefer NixOS' privileged wrapper over the unprivileged store binary."""
@@ -249,16 +295,25 @@ def update(url=None,replace=False):
             try: nodes_for_source,text,missing=future.result()
             except RuntimeError as e:
                 failed[name]=str(e)
+                kind='timeout' if 'timed out' in str(e) or 'timeout' in str(e) else \
+                     'http' if 'HTTP error' in str(e) else \
+                     'network' if 'network error' in str(e) else \
+                     'encoding' if 'encoding' in str(e) else 'other'
+                log_event('subscription_source',source_id=source_log_id(name),status='failed',reason=kind)
                 continue
             raw_path=RAW if name=='default' else RAW_DIR/(hashlib.sha256(name.encode()).hexdigest()[:16]+'.raw')
             save_text(raw_path,text+'\n')
             if not nodes_for_source:
                 failed[name]="no supported VLESS servers"
                 unparsed+=missing
+                log_event('subscription_source',source_id=source_log_id(name),status='unsupported',
+                          unsupported=missing)
                 continue
             fetched.extend(nodes_for_source)
             unparsed+=missing
             succeeded+=1
+            log_event('subscription_source',source_id=source_log_id(name),status='ok',
+                      profiles=len(nodes_for_source),unsupported=missing)
     if not fetched:
         details=', '.join(f'{name}: {reason}' for name,reason in failed.items())
         die(f"all subscription downloads failed ({details})")
@@ -280,6 +335,9 @@ def update(url=None,replace=False):
     save(DOWNLOAD,{'seconds':round(time.monotonic()-started,2)})
     duplicates=len(fetched)-current
     endpoints=len(endpoint_groups(merged[:current]))
+    log_event('subscription_refresh',status='ok',sources=len(sources),succeeded=succeeded,
+              endpoints=endpoints,current=current,retained=retained,duplicates=duplicates,
+              unsupported=unparsed,duration_ms=round((time.monotonic()-started)*1000))
     print(f"Updated {succeeded}/{len(sources)} subscriptions: {endpoints} current endpoints "
           f"({current} VLESS profiles); {duplicates} identical links collapsed; "
           f"{retained} older profiles retained; {unparsed} unsupported entries.")
@@ -414,13 +472,20 @@ def probe_urls(proxy,urls,timeout):
     for url in urls: command.extend(('-o','/dev/null',url))
     try:
         r=subprocess.run(command,capture_output=True,text=True,timeout=timeout+2)
-    except subprocess.TimeoutExpired: return [None]*len(urls)
+    except subprocess.TimeoutExpired:
+        log_event('curl_probe',status='timeout',sites=len(urls))
+        return [None]*len(urls)
     values=[None]*len(urls)
+    codes=[0]*len(urls)
     for line in r.stdout.splitlines():
         try:
             urlnum,status,elapsed=line.split(); urlnum=int(urlnum); status=int(status); elapsed=float(elapsed)
+            if 0<=urlnum<len(values): codes[urlnum]=status
             if 0<=urlnum<len(values) and 200<=status<400 and elapsed>0: values[urlnum]=elapsed*1000
         except ValueError: pass
+    log_event('curl_probe',status='ok' if any(v is not None for v in values) else 'failed',
+              exit_code=r.returncode,http_codes='-'.join(f'{code:03}' for code in codes),
+              sites=len(urls))
     return values
 def adaptive_timeout(previous,limit):
     if not isinstance(previous,(int,float)) or not math.isfinite(previous) or previous<=0: return min(limit,5.5)
@@ -439,12 +504,14 @@ def node_proxy(n,interface=None):
             end=time.monotonic()+2.5
             while time.monotonic()<end:
                 if x.poll() is not None:
+                    log_event('probe_xray',status='exited',exit_code=x.returncode,node_id=n['id'])
                     yield None
                     return
                 try:
                     with socket.create_connection(('127.0.0.1',p),.15): break
                 except OSError: time.sleep(.05)
             else:
+                log_event('probe_xray',status='startup_timeout',node_id=n['id'])
                 yield None
                 return
             yield f'socks5h://127.0.0.1:{p}'
@@ -456,8 +523,13 @@ def node_proxy(n,interface=None):
                     x.kill(); x.wait()
 def test(n,timeout,interface=None,urls=TEST_URLS):
     with node_proxy(n,interface) as proxy:
-        if proxy is None: return n['id'],None,[None]*len(urls)
+        if proxy is None:
+            log_event('node_probe',node_id=n['id'],status='proxy_unavailable')
+            return n['id'],None,[None]*len(urls)
         values=probe_urls(proxy,urls,timeout)
+        log_event('node_probe',node_id=n['id'],status='ok' if any(v is not None for v in values) else 'failed',
+                  latency_ms=probe_score(values),sites=''.join('1' if v is not None else '0' for v in values),
+                  timeout_ms=round(timeout*1000))
         return n['id'],probe_score(values),values
 def benchmark(ns,workers,timeout):
     if not ns: return {}
@@ -565,18 +637,31 @@ def benchmark_speeds(ns,pings,sites,selected_id,workers,timeout):
                   f"  {n['label']}: speed unavailable")
     return speeds
 def pingtest(timeout=10):
-    successful=[value for value in probe_urls(LOCAL_PROXY,TEST_URLS,timeout) if value is not None]
-    return round(min(successful),1) if successful else None
+    values=probe_urls(LOCAL_PROXY,TEST_URLS,timeout)
+    successful=[value for value in values if value is not None]
+    latency=round(min(successful),1) if successful else None
+    log_event('live_probe',status='ok' if successful else 'failed',latency_ms=latency,
+              sites=''.join('1' if v is not None else '0' for v in values),timeout_ms=round(timeout*1000))
+    return latency
 def routes_healthy():
-    if not pathlib.Path('/sys/class/net/blanc0').exists(): return False
+    if not pathlib.Path('/sys/class/net/blanc0').exists():
+        log_event('route_check',status='failed',reason='missing_interface')
+        return False
     families=['-4']
     if pathlib.Path('/proc/net/if_inet6').exists(): families.append('-6')
     for family in families:
         rules=subprocess.run(['ip',family,'rule','show'],capture_output=True,text=True)
         routes=subprocess.run(['ip',family,'route','show','table','4269'],capture_output=True,text=True)
-        if rules.returncode or routes.returncode: return False
-        if 'lookup 4269' not in (rules.stdout or ''): return False
+        family_name='ipv4' if family=='-4' else 'ipv6'
+        if rules.returncode or routes.returncode:
+            log_event('route_check',status='failed',family=family_name,reason='ip_command',
+                      rule_exit=rules.returncode,route_exit=routes.returncode)
+            return False
+        if 'lookup 4269' not in (rules.stdout or ''):
+            log_event('route_check',status='failed',family=family_name,reason='missing_rule')
+            return False
         if not any(line.split()[:3]==['default','dev','blanc0'] for line in (routes.stdout or '').splitlines()):
+            log_event('route_check',status='failed',family=family_name,reason='missing_default')
             return False
     return True
 def failover(_):
@@ -587,6 +672,7 @@ def failover(_):
     if not active:
         failed=subprocess.run(['systemctl','is-failed','--quiet','blancctl.service']).returncode==0
         if not failed:
+            log_event('failover',status='stopped')
             print("BlancVPN is stopped; skipping this failover check.")
             return
         with try_operation_lock() as available:
@@ -594,9 +680,12 @@ def failover(_):
                 print("Configuration operation in progress; skipping this failover check.")
                 return
             if subprocess.run(['systemctl','is-failed','--quiet','blancctl.service']).returncode==0:
+                log_event('failover',status='service_failed',action='restart')
                 print("BlancVPN service failed; attempting to restart it.")
                 try: service('restart')
-                except SystemExit: print("Service restart failed; checking cached alternatives.")
+                except SystemExit:
+                    log_event('failover',status='restart_failed')
+                    print("Service restart failed; checking cached alternatives.")
         active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
         failed=True
     else:
@@ -611,6 +700,7 @@ def failover(_):
     latency=None if disabled_current or not active else pingtest(timeout)
     if latency is not None:
         if not routes_healthy():
+            log_event('failover',status='route_missing')
             now=int(time.time())
             if now-state.get('route_repair_at',0)<120:
                 print("TUN route is still unavailable; waiting before another repair attempt.")
@@ -626,17 +716,24 @@ def failover(_):
                 save(FAILOVER,{**state,'route_repair_at':now,'checked_at':now})
                 state['route_repair_at']=now
                 print("TUN route is unavailable; restarting Xray to restore it.")
+                log_event('failover',status='route_repair',action='restart')
                 try: service('restart')
                 except SystemExit:
+                    log_event('failover',status='route_repair_failed')
                     print("TUN route repair failed; will retry later.")
                     return
             if not routes_healthy() or pingtest(timeout) is None:
+                log_event('failover',status='route_still_missing')
                 print("TUN route remains unavailable after restart; will retry later.")
                 return
-        if state.get('failures',0): print(f"Connection recovered: {latency:.0f} ms")
+        if state.get('failures',0):
+            log_event('failover',status='recovered',latency_ms=latency)
+            print(f"Connection recovered: {latency:.0f} ms")
         save(FAILOVER,{**state,'failures':0,'checked_at':int(time.time())})
         return
     failures=threshold if disabled_current or failed else state.get('failures',0)+1
+    log_event('failover',status='health_failed',failures=failures,threshold=threshold,
+              service_active=active,disabled_current=disabled_current)
     save(FAILOVER,{'failures':failures,'checked_at':int(time.time())})
     if failures < threshold:
         print(f"Health check failed ({failures}/{threshold}); keeping the current server.")
@@ -660,7 +757,9 @@ def failover(_):
         probes={pool.submit(test,n,timeout,urls=TEST_URLS):n for n in candidates}
         for future in concurrent.futures.as_completed(probes):
             try: _,candidate_latency,sites=future.result()
-            except Exception: continue
+            except Exception as exc:
+                log_exception('failover_candidate_error',exc,node_id=probes[future]['id'])
+                continue
             if candidate_latency is not None:
                 working.append((probes[future],candidate_latency,sum(value is not None for value in sites)))
     working.sort(key=lambda item:(-item[2],item[1]))
@@ -678,16 +777,21 @@ def failover(_):
                 return
             recovered_latency=None if disabled_current or not now_active else pingtest(timeout)
             if recovered_latency is not None:
+                log_event('failover',status='recovered_during_scan',latency_ms=recovered_latency)
                 print(f"Connection recovered during failover testing: {recovered_latency:.0f} ms")
                 save(FAILOVER,{'failures':0,'checked_at':int(time.time())})
                 return
             print(f"Failing over to {n['label']} ({candidate_latency:.0f} ms).")
+            log_event('failover',status='switch_attempt',node_id=n['id'],latency_ms=candidate_latency)
             try: select(n,ping=candidate_latency)
             except SystemExit:
+                log_event('failover',status='switch_failed',node_id=n['id'])
                 print("Alternative failed its live check; trying the next cached server.")
                 continue
+            log_event('failover',status='switched',node_id=n['id'],latency_ms=candidate_latency)
             save(FAILOVER,{'failures':0,'checked_at':int(time.time()),'switched_at':int(time.time())})
             return
+    log_event('failover',status='no_working_alternative',candidates=len(candidates))
     print("Failover could not find a working cached server; will retry later.")
 def record_speed():
     stats=load(STATS,{}); stats['speed_mbps']=speedtest(); stats['tested_at']=int(time.time()); save(STATS,stats)
@@ -731,10 +835,13 @@ def service(action):
     sudo=sudo_executable()
     if sudo is None: die("required command is missing: sudo")
     r=subprocess.run([sudo,'-n',CONTROL,action],capture_output=True,text=True)
+    log_event('service_control',action=action,status='ok' if r.returncode==0 else 'failed',
+              exit_code=r.returncode)
     if r.returncode:
         detail=(r.stderr or r.stdout).strip().splitlines()
         reason=f": {detail[-1]}" if detail else ""
         die(f"service control failed{reason}; repair with: sudo xray-ctl-setup {owner}")
+    if action=='log' and r.stdout: print(r.stdout,end='')
 
 def dead_local_proxy_environment():
     names=('HTTP_PROXY','HTTPS_PROXY','FTP_PROXY','ALL_PROXY',
@@ -786,6 +893,7 @@ def doctor(_):
     print(f"{paint('32','OK')}  xray-ctl {VERSION} is configured for {user}")
 def select(n,restart=True,ping=None,speed=None,force=False):
     if disabled_node(n): die("Russia endpoints are disabled; no connection was changed")
+    log_event('selection',status='started',node_id=n['id'],restart=restart)
     config=tun(n)
     if restart and not force and CONF.exists() and PICK.exists():
         previous_pick=load(PICK,{})
@@ -801,6 +909,7 @@ def select(n,restart=True,ping=None,speed=None,force=False):
         c=pathlib.Path(d)/'c.json'; c.write_text(json.dumps(validation))
         r=subprocess.run(['xray','run','-test','-c',str(c)],capture_output=True,text=True)
         if r.returncode:
+            log_event('selection',status='invalid_config',node_id=n['id'],exit_code=r.returncode)
             detail=(r.stderr or r.stdout).strip().splitlines()
             die("generated Xray TUN configuration is invalid"+(f": {detail[-1]}" if detail else ""))
     previous={p:p.read_text() if p.exists() else None for p in (CONF,PICK,STATS)}
@@ -813,6 +922,8 @@ def select(n,restart=True,ping=None,speed=None,force=False):
             if os.getenv('BLANCCTL_NO_SERVICE')!='1' and pingtest(5.5) is None:
                 raise ConnectionError("new server did not pass a live connectivity check")
         except (SystemExit,ConnectionError) as failure:
+            log_event('selection',status='rollback',node_id=n['id'],
+                      reason='live_probe' if isinstance(failure,ConnectionError) else 'restart')
             for path,old_text in previous.items():
                 if old_text is None: path.unlink(missing_ok=True)
                 else: save_text(path,old_text)
@@ -821,6 +932,7 @@ def select(n,restart=True,ping=None,speed=None,force=False):
                 except SystemExit: die("new connection failed; previous configuration was restored but its service restart failed")
             reason=str(failure) if isinstance(failure,ConnectionError) else 'service restart failed'
             die(f"{reason}; previous configuration restored")
+    log_event('selection',status='selected',node_id=n['id'],latency_ms=ping,speed_mbps=speed)
     print(paint('1;32','Selected:'),paint('36',n['label']))
 def start(_):
     old=load(PICK,{})
@@ -867,6 +979,7 @@ def refresh_cache(_):
         with try_operation_lock() as available:
             if available:
                 save(REFRESH_STATUS,{'state':'running','started_at':int(time.time())})
+                log_event('background_refresh',status='running')
                 errors=io.StringIO()
                 try:
                     with contextlib.redirect_stderr(errors): refreshed=update()
@@ -874,17 +987,21 @@ def refresh_cache(_):
                     lines=errors.getvalue().strip().splitlines()
                     save(REFRESH_STATUS,{'state':'failed','finished_at':int(time.time()),
                       'message':lines[-1] if lines else 'subscription update failed'})
-                except Exception:
+                    log_event('background_refresh',status='failed',reason='subscription_error')
+                except Exception as exc:
                     save(REFRESH_STATUS,{'state':'failed','finished_at':int(time.time()),
                       'message':'unexpected subscription update error'})
+                    log_exception('background_refresh_error',exc)
                 else:
                     save(REFRESH_STATUS,{'state':'completed','finished_at':int(time.time()),
                       'current':sum(not n.get('stale') for n in refreshed),
                       'retained':sum(bool(n.get('stale')) for n in refreshed)})
+                    log_event('background_refresh',status='completed')
                 return
         if time.monotonic()>=deadline:
             save(REFRESH_STATUS,{'state':'failed','finished_at':int(time.time()),
               'message':'another configuration operation held the lock for 60 seconds'})
+            log_event('background_refresh',status='failed',reason='lock_timeout')
             return
         time.sleep(.25)
 def background_refresh():
@@ -893,6 +1010,7 @@ def background_refresh():
         print("Subscription refresh is already running; check: xray-ctl update-status")
         return
     save(REFRESH_STATUS,{'state':'queued','started_at':int(time.time())})
+    log_event('background_refresh',status='queued')
     try:
         subprocess.Popen([sys.executable,os.path.abspath(__file__),'refresh-cache'],
           stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
@@ -901,6 +1019,7 @@ def background_refresh():
         save(REFRESH_STATUS,{'state':'failed','finished_at':int(time.time()),
           'message':'background process could not start'})
         print(f"Background subscription refresh could not start: {e}",file=sys.stderr)
+        log_exception('background_refresh_error',e)
         return
     print("Subscription refresh started in the background; check: xray-ctl update-status")
 def update_status(_):
@@ -1009,7 +1128,21 @@ def status(_):
     ping=f"{ping_value:.0f} ms" if ping_value is not None else f"ping {paint('31','n/a')}"
     speed=f"{speed_value:.1f} Mbps" if speed_value is not None else f"speed {paint('31','n/a')}"
     print(f"{paint('32','● BlancVPN')}  {paint('36',place)} · {ping} · {speed}")
-def logs(_): service('log')
+def logs(a):
+    if a.service:
+        service('log')
+        return
+    paths=[diagnostic_log_path().with_name(f'events.jsonl.{n}')
+           for n in range(LOG_BACKUPS,0,-1)]+[diagnostic_log_path()]
+    recent=collections.deque(maxlen=a.lines)
+    for path in paths:
+        try:
+            with path.open() as stream: recent.extend(stream)
+        except FileNotFoundError: continue
+    if not recent:
+        print('No diagnostic events recorded yet.')
+        return
+    for line in recent: print(line,end='')
 def proxy(_): print(f"SOCKS5  {LOCAL_PROXY}")
 def main():
     require_user()
@@ -1022,16 +1155,40 @@ def main():
     rt=s.add_parser('route'); rt.add_argument('args',nargs='+'); rt.set_defaults(fn=route)
     s.add_parser('update-status').set_defaults(fn=update_status)
     s.add_parser('refresh-cache',help=argparse.SUPPRESS).set_defaults(fn=refresh_cache)
-    s.add_parser('status').set_defaults(fn=status); s.add_parser('log').set_defaults(fn=logs)
+    s.add_parser('status').set_defaults(fn=status)
+    lg=s.add_parser('log'); lg.add_argument('--lines',type=int,default=100)
+    lg.add_argument('--service',action='store_true',help='show Xray and failover systemd journal')
+    lg.set_defaults(fn=logs)
     s.add_parser('doctor').set_defaults(fn=doctor)
     s.add_parser('proxy').set_defaults(fn=proxy)
     s.add_parser('stop').set_defaults(fn=lambda _:service('stop'))
     s.add_parser('failover-check',help=argparse.SUPPRESS).set_defaults(fn=failover)
     a=p.parse_args(); fn=start if a.cmd is None else a.fn
-    if a.cmd in (None,'start','stop','country','update','best','subscription','route'):
-        try:
-            with operation_lock(): fn(a)
-        finally:
-            if a.cmd=='best' and getattr(a,'refresh_after',False): background_refresh()
-    else: fn(a)
+    if a.cmd=='log' and not 1<=a.lines<=10000: p.error('--lines must be between 1 and 10000')
+    command=a.cmd or 'start'
+    started=time.monotonic()
+    log_event('command',command=command,status='started')
+    try:
+        if a.cmd in (None,'start','stop','country','update','best','subscription','route'):
+            try:
+                with operation_lock(): fn(a)
+            finally:
+                if a.cmd=='best' and getattr(a,'refresh_after',False): background_refresh()
+        else: fn(a)
+    except SystemExit as exc:
+        log_event('command',command=command,status='failed',exit_code=exc.code if isinstance(exc.code,int) else 1,
+                  duration_ms=round((time.monotonic()-started)*1000))
+        raise
+    except KeyboardInterrupt:
+        log_event('command',command=command,status='interrupted',
+                  duration_ms=round((time.monotonic()-started)*1000))
+        raise
+    except Exception as exc:
+        log_exception('unexpected_error',exc,command=command)
+        log_event('command',command=command,status='failed',
+                  duration_ms=round((time.monotonic()-started)*1000))
+        raise
+    else:
+        log_event('command',command=command,status='ok',
+                  duration_ms=round((time.monotonic()-started)*1000))
 if __name__=='__main__': main()

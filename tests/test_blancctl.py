@@ -22,6 +22,12 @@ def sample(label, host):
 
 
 class NodeCacheTests(unittest.TestCase):
+    def setUp(self):
+        # Unit tests must never append diagnostics to the live installation.
+        patcher=mock.patch.object(blancctl,'log_event')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_subscription_timeout_is_bounded_and_adaptive(self):
         with mock.patch.object(blancctl, 'load', return_value={}):
             self.assertEqual(blancctl.download_limits(), (2.5, 8))
@@ -639,6 +645,8 @@ class NodeCacheTests(unittest.TestCase):
         self.assertIsNone(values[2])
         self.assertEqual(blancctl.probe_score(values), 200)
         self.assertEqual(blancctl.probe_score([100, 200, 300, 400]), 250)
+        blancctl.log_event.assert_any_call('curl_probe',status='ok',exit_code=0,
+                                           http_codes='204-200-403-200',sites=4)
 
     def test_live_health_accepts_any_successful_site(self):
         with mock.patch.object(blancctl, 'probe_urls', return_value=[None, 230, None, None]):
@@ -927,6 +935,51 @@ class NodeCacheTests(unittest.TestCase):
                 result,sites = blancctl.benchmark([a, b], 2, 8)
         self.assertEqual((result[a['id']], result[b['id']]), (100, 100))
         self.assertEqual(sites[a['id']], [True]*4)
+
+
+class DiagnosticLogTests(unittest.TestCase):
+    def test_private_rotating_log_redacts_urls_and_exception_messages(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(blancctl,'STATE',pathlib.Path(tmp)), \
+             mock.patch.object(blancctl,'LOG_LIMIT',260), \
+             mock.patch.object(blancctl,'LOG_BACKUPS',2):
+            for number in range(12):
+                blancctl.log_event('test_probe',node_id='node-001',sequence=number,
+                                   secret='vless://uuid@private.example?token=secret')
+            try: raise RuntimeError('https://private.example/sub?token=secret')
+            except RuntimeError as exc: blancctl.log_exception('test_error',exc)
+            path=blancctl.diagnostic_log_path()
+            files=[path,path.with_name(path.name+'.1'),path.with_name(path.name+'.2')]
+            self.assertTrue(all(p.exists() for p in files))
+            self.assertEqual(path.stat().st_mode & 0o777,0o600)
+            self.assertEqual((path.parent/'events.lock').stat().st_mode & 0o777,0o600)
+            data=''.join(p.read_text() for p in files)
+            self.assertIn('redacted',data)
+            self.assertIn('test_error',data)
+            self.assertNotIn('private.example',data)
+            self.assertNotIn('token=secret',data)
+            self.assertTrue(all(json.loads(line)['event'] for line in data.splitlines()))
+
+    def test_log_command_reads_rotated_history_without_service_access(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(blancctl,'STATE',pathlib.Path(tmp)), \
+             mock.patch.object(blancctl,'LOG_LIMIT',220), \
+             mock.patch.object(blancctl,'LOG_BACKUPS',2):
+            for number in range(5): blancctl.log_event('check',sequence=number)
+            output=io.StringIO()
+            with contextlib.redirect_stdout(output):
+                blancctl.logs(argparse.Namespace(lines=3,service=False))
+            lines=[json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual([line['sequence'] for line in lines],[2,3,4])
+
+    def test_log_write_failure_does_not_mask_operation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            invalid=pathlib.Path(tmp)/'not-a-directory'
+            invalid.write_text('occupied')
+            errors=io.StringIO()
+            with mock.patch.object(blancctl,'STATE',invalid), contextlib.redirect_stderr(errors):
+                blancctl.log_event('test')
+            self.assertIn('diagnostic logging unavailable',errors.getvalue())
 
 
 if __name__ == '__main__':
