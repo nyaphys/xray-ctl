@@ -2,6 +2,11 @@
 
 Xray VLESS subscription manager with multiple sources, node selection, and configurable split tunneling on Linux.
 
+Project documents: [verifiable requirements](REQUIREMENTS.md),
+[architecture](docs/architecture.md), and a [split-tunneling guide](docs/split-tunneling.md)
+with the `cldom.ru` diagnostic case. The requirements distinguish implemented
+behavior from pending end-to-end verification and proposed improvements.
+
 ## Arch Linux installation
 
 Until the AUR package is published, clone this repository and build the local
@@ -170,6 +175,10 @@ fail-closed behavior depend on the host's resolver and firewall; this tool
 does not promise leak protection when the tunnel is unavailable.
 Sniffing uses `routeOnly`, so domain decisions can coexist with matching the
 original destination IP without changing that destination.
+For a domain that works through the physical interface but times out through
+`blanc0`, investigate the split-tunneling policy before blaming the selected
+node. `curl --noproxy '*'` bypasses an application proxy, not Linux TUN policy
+routing; see the [diagnostic procedure](docs/split-tunneling.md).
 
 `best` selects from the cached subscription, then starts a background refresh
 after releasing its configuration lock. The command does not wait for that
