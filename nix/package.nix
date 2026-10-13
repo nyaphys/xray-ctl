@@ -13,7 +13,7 @@
 
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "xray-ctl";
-  version = "0.6.4";
+  version = "0.6.9";
 
   src = lib.fileset.toSource {
     root = ../.;
@@ -49,7 +49,7 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     wrapProgram "$out/libexec/blancctl/service-control" \
       --prefix PATH : ${lib.makeBinPath [ coreutils systemd ]}
     wrapProgram "$out/libexec/blancctl/tun-route" \
-      --prefix PATH : ${lib.makeBinPath [ coreutils iproute2 ]}
+      --prefix PATH : ${lib.makeBinPath [ coreutils iproute2 python3 ]}
 
     runHook postInstall
   '';

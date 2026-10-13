@@ -3,6 +3,15 @@ set -euo pipefail
 
 table=4269
 priority=1042
+sys_class_net="${BLANCCTL_SYS_CLASS_NET:-/sys/class/net}"
+tun_wait_seconds="${BLANCCTL_TUN_WAIT_SECONDS:-30}"
+xray_config="${BLANCCTL_XRAY_CONFIG:-/var/lib/blancctl/xray.json}"
+state_dir="${BLANCCTL_STATE_DIR:-/var/lib/blancctl}"
+route_mark=4269
+[[ "$tun_wait_seconds" =~ ^[1-9][0-9]*$ ]] || {
+    echo "blancctl: BLANCCTL_TUN_WAIT_SECONDS must be a positive integer" >&2
+    exit 2
+}
 private_networks=(
     10.0.0.0/8
     100.64.0.0/10
@@ -20,29 +29,102 @@ private_networks6=(
 )
 
 stop_routes() {
+    while ip -4 rule del priority "$((priority - 1))" fwmark "$route_mark" table main 2>/dev/null; do :; done
     while ip -4 rule del priority "$priority" table "$table" 2>/dev/null; do :; done
     ip -4 route flush table "$table" 2>/dev/null || true
+    while ip -6 rule del priority "$((priority - 1))" fwmark "$route_mark" table main 2>/dev/null; do :; done
     while ip -6 rule del priority "$priority" table "$table" 2>/dev/null; do :; done
     ip -6 route flush table "$table" 2>/dev/null || true
+}
+
+install_endpoint_bypass() {
+    local endpoint="$1" required="${2:-0}" address resolved=0
+    [[ -n "$endpoint" ]] || return 0
+    if [[ "$endpoint" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        ip -4 route replace throw "$endpoint/32" table "$table"
+        resolved=1
+    elif [[ "$endpoint" == *:* ]]; then
+        ip -6 route replace throw "$endpoint/128" table "$table"
+        resolved=1
+    else
+        while read -r address _; do
+            [[ -n "$address" ]] || continue
+            if [[ "$address" == *:* ]]; then
+                ip -6 route replace throw "$address/128" table "$table"
+            else
+                ip -4 route replace throw "$address/32" table "$table"
+            fi
+            resolved=$((resolved + 1))
+        done < <(getent ahosts "$endpoint" 2>/dev/null)
+    fi
+    if [[ "$required" == 1 && "$resolved" -eq 0 ]]; then
+        echo "blancctl: could not resolve selected Xray server" >&2
+        return 1
+    fi
+}
+
+cached_endpoints() {
+    python3 - "$state_dir/nodes.json" "$state_dir/retained-nodes.json" <<'PY'
+import json, pathlib, sys
+seen = set()
+for name in sys.argv[1:]:
+    try:
+        records = json.loads(pathlib.Path(name).read_text())
+    except (OSError, ValueError):
+        continue
+    if not isinstance(records, list):
+        continue
+    for record in records:
+        address = record.get("address") if isinstance(record, dict) else None
+        if isinstance(address, str) and address and address not in seen:
+            seen.add(address)
+            print(address)
+PY
+}
+
+install_cached_bypasses() {
+    local endpoint
+    while IFS= read -r endpoint; do
+        install_endpoint_bypass "$endpoint" 0 || true
+    done < <(cached_endpoints)
 }
 
 case "${1:-}" in
     start)
         stop_routes
-        for _ in {1..50}; do
-            [[ -e /sys/class/net/blanc0 ]] && break
+        # Xray creates its TUN asynchronously. On a cold start (notably after
+        # a NixOS switch) DNS and endpoint initialization can exceed 5 seconds.
+        for ((attempt=0; attempt<tun_wait_seconds*10; attempt++)); do
+            [[ -e "$sys_class_net/blanc0" ]] && break
             sleep 0.1
         done
-        [[ -e /sys/class/net/blanc0 ]] || { echo "blancctl: blanc0 was not created" >&2; exit 1; }
+        [[ -e "$sys_class_net/blanc0" ]] || {
+            echo "blancctl: blanc0 was not created within ${tun_wait_seconds}s" >&2
+            exit 1
+        }
         ip link set blanc0 up
         ip address replace 172.30.0.1/30 dev blanc0
+        endpoint=$(sed -n '/"address"[[:space:]]*:/ { s/.*"address"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/; p; q; }' "$xray_config")
+        [[ -n "$endpoint" ]] || {
+            echo "blancctl: Xray server address is missing from the configuration" >&2
+            exit 1
+        }
         # Leave local and private destinations to the main routing table. A
         # throw route ends this table's lookup without selecting blanc0, so
         # LAN traffic never enters Xray and survives service restarts.
         for network in "${private_networks[@]}"; do
             ip -4 route replace throw "$network" table "$table"
         done
+        # The VPN server itself must stay outside the catch-all TUN route.
+        # Resolve it before installing the policy rule, then let matching
+        # packets continue to the ordinary main routing table.
+        install_endpoint_bypass "$endpoint" 1
+        # `best` starts short-lived Xray processes for every cached profile.
+        # Their server sockets must also bypass the catch-all TUN route;
+        # otherwise candidates are accidentally tested through the current VPN.
+        install_cached_bypasses
         ip -4 route replace default dev blanc0 table "$table"
+        ip -4 rule add priority "$((priority - 1))" fwmark "$route_mark" table main
         ip -4 rule add priority "$priority" table "$table"
         # Route public IPv6 through the same TUN. Without this rule a dual-stack
         # browser could bypass the proxy over the host's ordinary IPv6 default.
@@ -52,14 +134,22 @@ case "${1:-}" in
                 ip -6 route replace throw "$network" table "$table"
             done
             ip -6 route replace default dev blanc0 table "$table"
+            ip -6 rule add priority "$((priority - 1))" fwmark "$route_mark" table main
             ip -6 rule add priority "$priority" table "$table"
         fi
+        ;;
+    refresh)
+        # Add newly downloaded subscription endpoints without interrupting the
+        # current default route. A service restart later rebuilds the table and
+        # removes bypasses that are no longer cached.
+        [[ -e "$sys_class_net/blanc0" ]] || exit 0
+        install_cached_bypasses
         ;;
     stop)
         stop_routes
         ;;
     *)
-        echo "usage: tun-route {start|stop}" >&2
+        echo "usage: tun-route {start|refresh|stop}" >&2
         exit 2
         ;;
 esac

@@ -9,3 +9,4 @@ ALL ALL=(root) NOPASSWD: /usr/lib/blancctl/service-control stop
 ALL ALL=(root) NOPASSWD: /usr/lib/blancctl/service-control restart
 ALL ALL=(root) NOPASSWD: /usr/lib/blancctl/service-control status
 ALL ALL=(root) NOPASSWD: /usr/lib/blancctl/service-control log
+ALL ALL=(root) NOPASSWD: /usr/lib/blancctl/service-control routes

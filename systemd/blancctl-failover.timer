@@ -1,5 +1,5 @@
 [Unit]
-Description=Check BlancVPN connectivity every 30 seconds
+Description=Check xray-ctl connectivity every 30 seconds
 
 [Timer]
 OnBootSec=45s

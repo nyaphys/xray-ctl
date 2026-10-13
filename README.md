@@ -216,10 +216,20 @@ in parallel and take at most four seconds of download time each. A speed test
 failure never marks a working profile as dead; a measured gain must exceed 30%
 to change the latency-based choice or an already healthy selection. `status`
 still measures live download speed separately. After a switch, `xray-ctl`
-checks the running SOCKS path; if no test site works, it
+checks both the running SOCKS path and the system TUN path; if either fails, it
 restores the previous configuration and restarts the previous connection. If
 the already-running server and generated configuration are unchanged, `best`
 keeps that connection instead of restarting it.
+
+Before testing, 0.6.9 refreshes host `throw` routes for every cached VPN
+endpoint. This is required while the catch-all TUN is already active: without
+those routes, a temporary candidate Xray can be chained through the currently
+selected VPN and the benchmark no longer measures that candidate directly.
+The running Xray also marks its own proxy and direct sockets; a higher-priority
+policy rule sends those marked sockets to the ordinary main routing table while
+unmarked application traffic continues into `blanc0`. The post-switch timeout
+is derived from the candidate's measured latency and reports routes, SOCKS and
+TUN failures separately.
 
 Subscription refreshes move profiles missing from the latest response to the
 private `retained-nodes.json` backup cache; `nodes.json` contains only current
@@ -257,14 +267,15 @@ NekoBox, `xray-ctl` does not use sing-box, and carrier-specific Extra profiles
 still depend on the subscription settings enabled by the provider.
 
 Automatic monitoring is enabled by `xray-ctl-setup` on Arch and by default in
-the NixOS module. `blancctl-failover.timer` checks the live SOCKS path against
-all four sites every 30 seconds. A transient failure keeps the current node;
-the timer switches only after three consecutive checks in which none of the
-sites are reachable. The six best distinct cached alternatives are tested in
-parallel, prioritizing site coverage and then latency. A failed Xray systemd
-unit is restarted before changing nodes. If the SOCKS path works but the TUN
-policy route is missing, the timer first restarts Xray to restore that route,
-with a cooldown between repair attempts. Endpoint probes do not hold the
+the NixOS module. In 0.6.9, `blancctl-failover.timer` checks both live SOCKS
+and ordinary TUN traffic against the four control sites after each 30-second
+interval. A transient failure keeps the current node. After repeated SOCKS
+failures, it first retries the same server, then tests up to six distinct
+cached alternatives in parallel, prioritizing site coverage and latency.
+If SOCKS works but the TUN route or data path fails, the timer repairs that
+path without switching nodes. Repairs have a cooldown to avoid restart loops.
+This checks connectivity, not every browser subresource or every user rule;
+use `route test DOMAIN` for a particular site. Endpoint probes do not hold the
 configuration lock; the lock is taken only while changing the selected server.
 A failover pass is scheduled 30 seconds after the previous pass finishes,
 preventing back-to-back retries when every endpoint is unavailable. Checks
@@ -328,4 +339,4 @@ for the privileged service helper; `xray-ctl doctor` verifies those rules.
 It also rejects stale `HTTP_PROXY`, `HTTPS_PROXY`, `FTP_PROXY`, or `ALL_PROXY`
 variables when they point to a closed localhost port. Those variables override
 the TUN route in terminal applications and can otherwise make programs such as
-Codex look offline even while BlancVPN itself is healthy.
+Codex look offline even while the VPN tunnel itself is healthy.

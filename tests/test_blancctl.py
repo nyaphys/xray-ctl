@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import http.server
 import io
+import os
 import pathlib
 import json
 import shutil
@@ -22,6 +23,58 @@ def sample(label, host):
         f"vless://12345678-1234-1234-1234-123456789abc@{host}:443"
         f"?security=reality&type=tcp&flow=xtls-rprx-vision#{label}", 0
     )
+
+
+class TunRouteTests(unittest.TestCase):
+    def test_waits_for_delayed_tun_device(self):
+        script = pathlib.Path(__file__).parents[1] / 'lib' / 'tun-route'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            fake_bin = root / 'bin'
+            fake_sys = root / 'sys-class-net'
+            counter = root / 'sleep-count'
+            fake_bin.mkdir()
+            fake_sys.mkdir()
+            counter.write_text('0\n')
+            ip_log = root / 'ip.log'
+            config = root / 'xray.json'
+            config.write_text('{"outbounds":[{"settings":{"vnext":[{"address":"203.0.113.9"}]}}]}\n')
+            (root/'nodes.json').write_text(json.dumps([
+                {'address':'198.51.100.7'}, {'address':'2001:db8::7'}]))
+            (fake_bin / 'ip').write_text(
+                '#!/bin/sh\n'
+                'printf "%s\\n" "$*" >> "$BLANCCTL_TEST_IP_LOG"\n'
+                'case "$*" in *"rule del"*) exit 1 ;; *) exit 0 ;; esac\n'
+            )
+            (fake_bin / 'sleep').write_text(
+                '#!/bin/sh\n'
+                'count=$(cat "$BLANCCTL_TEST_COUNTER")\n'
+                'count=$((count + 1))\n'
+                'printf "%s\\n" "$count" > "$BLANCCTL_TEST_COUNTER"\n'
+                'if [ "$count" -eq 3 ]; then mkdir -p "$BLANCCTL_SYS_CLASS_NET/blanc0"; fi\n'
+            )
+            (fake_bin / 'ip').chmod(0o755)
+            (fake_bin / 'sleep').chmod(0o755)
+            env = os.environ.copy()
+            env.update({
+                'PATH': f'{fake_bin}:/usr/bin:/bin',
+                'BLANCCTL_SYS_CLASS_NET': str(fake_sys),
+                'BLANCCTL_TUN_WAIT_SECONDS': '1',
+                'BLANCCTL_TEST_COUNTER': str(counter),
+                'BLANCCTL_TEST_IP_LOG': str(ip_log),
+                'BLANCCTL_XRAY_CONFIG': str(config),
+                'BLANCCTL_STATE_DIR': str(root),
+            })
+            result = subprocess.run(
+                ['/usr/bin/bash', str(script), 'start'], env=env,
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(counter.read_text().strip(), '3')
+            self.assertIn('-4 route replace throw 203.0.113.9/32 table 4269', ip_log.read_text())
+            self.assertIn('-4 route replace throw 198.51.100.7/32 table 4269', ip_log.read_text())
+            self.assertIn('-6 route replace throw 2001:db8::7/128 table 4269', ip_log.read_text())
+            self.assertIn('-4 rule add priority 1041 fwmark 4269 table main', ip_log.read_text())
 
 
 class NodeCacheTests(unittest.TestCase):
@@ -377,12 +430,14 @@ class NodeCacheTests(unittest.TestCase):
              mock.patch.object(blancctl, 'update') as update, \
              mock.patch.object(blancctl, 'benchmark_choice', return_value=(node, {node['id']: 42})) as choice, \
              mock.patch.object(blancctl, 'select') as select, \
+             mock.patch.object(blancctl, 'service') as service, \
              mock.patch.object(blancctl, 'record_speed') as speed:
             blancctl.allbest(args)
         update.assert_not_called()
         speed.assert_not_called()
         choice.assert_called_once_with([node], 2, 8, [])
         select.assert_called_once_with(node, ping=42)
+        service.assert_called_once_with('routes')
         self.assertTrue(args.refresh_after)
 
     def test_retained_servers_are_tested_if_current_profiles_fail(self):
@@ -427,10 +482,12 @@ class NodeCacheTests(unittest.TestCase):
         with mock.patch.object(blancctl,'cached_nodes',return_value=([ru,other],[old_ru,old_other])), \
              mock.patch.object(blancctl,'load',return_value={'id':'old-ru'}), \
              mock.patch.object(blancctl,'benchmark_choice',return_value=(other,{other['id']:42})) as choice, \
+             mock.patch.object(blancctl,'service') as service, \
              mock.patch.object(blancctl,'select') as select:
             blancctl.allbest(args)
         choice.assert_called_once_with([other],2,8,[old_other])
         select.assert_called_once_with(other,ping=42)
+        service.assert_called_once_with('routes')
 
     def test_russia_cannot_be_selected_explicitly_or_shown_in_countries(self):
         ru=sample('🇷🇺 Russia','ru.example')
@@ -475,6 +532,7 @@ class NodeCacheTests(unittest.TestCase):
              mock.patch.object(blancctl,'load',return_value={}), \
              mock.patch.object(blancctl,'save'), \
              mock.patch.object(blancctl,'test',return_value=(other['id'],50,[50]*4)) as probe, \
+             mock.patch.object(blancctl,'service') as service, \
              mock.patch.object(blancctl,'select') as select, \
              mock.patch.dict(blancctl.os.environ,{'BLANCCTL_FAILOVER_FAILURES':'1'}), \
              contextlib.redirect_stdout(io.StringIO()):
@@ -482,6 +540,7 @@ class NodeCacheTests(unittest.TestCase):
         probe.assert_called_once()
         self.assertIs(probe.call_args.args[0],other)
         select.assert_called_once_with(other,ping=50)
+        self.assertEqual(service.call_args_list,[mock.call('restart'),mock.call('routes')])
 
     def test_failover_replaces_a_healthy_but_disabled_russia_selection(self):
         ru=sample('🇷🇺 Russia','ru.example')
@@ -495,11 +554,13 @@ class NodeCacheTests(unittest.TestCase):
              mock.patch.object(blancctl,'load',side_effect=state), \
              mock.patch.object(blancctl,'save'), \
              mock.patch.object(blancctl,'test',return_value=(other['id'],50,[50]*4)), \
+             mock.patch.object(blancctl,'service') as service, \
              mock.patch.object(blancctl,'select') as select, \
              contextlib.redirect_stdout(io.StringIO()):
             blancctl.failover(None)
         pingtest.assert_not_called()
         select.assert_called_once_with(other,ping=50)
+        service.assert_called_once_with('routes')
 
     def test_failover_keeps_a_deliberately_stopped_service_off(self):
         def systemctl(args, **_):
@@ -523,6 +584,7 @@ class NodeCacheTests(unittest.TestCase):
                  mock.patch.object(blancctl, 'try_operation_lock', side_effect=lambda:contextlib.nullcontext(True)), \
                  mock.patch.object(blancctl, 'service') as service, \
                  mock.patch.object(blancctl, 'pingtest', return_value=80), \
+                 mock.patch.object(blancctl, 'tun_pingtest', return_value=80), \
                  mock.patch.object(blancctl, 'routes_healthy', return_value=True), \
                  mock.patch.object(blancctl, 'select') as select, \
                  contextlib.redirect_stdout(io.StringIO()):
@@ -546,12 +608,14 @@ class NodeCacheTests(unittest.TestCase):
              mock.patch.object(blancctl,'load',return_value={}), \
              mock.patch.object(blancctl,'save'), \
              mock.patch.object(blancctl,'test',side_effect=probe) as test, \
+             mock.patch.object(blancctl,'service') as service, \
              mock.patch.object(blancctl,'select') as select, \
              mock.patch.dict(blancctl.os.environ,{'BLANCCTL_FAILOVER_FAILURES':'1'}), \
              contextlib.redirect_stdout(io.StringIO()):
             blancctl.failover(None)
         self.assertEqual(test.call_count,2)
         select.assert_called_once_with(b,ping=110)
+        self.assertEqual(service.call_args_list,[mock.call('restart'),mock.call('routes')])
 
     def test_failover_repairs_missing_tun_route_without_switching_nodes(self):
         with mock.patch.object(blancctl.subprocess,'run',return_value=subprocess.CompletedProcess([],0)), \
@@ -559,15 +623,62 @@ class NodeCacheTests(unittest.TestCase):
              mock.patch.object(blancctl,'load',return_value={}), \
              mock.patch.object(blancctl,'save'), \
              mock.patch.object(blancctl,'pingtest',return_value=90) as pingtest, \
+             mock.patch.object(blancctl,'tun_pingtest',return_value=80), \
+             mock.patch.object(blancctl,'live_paths',return_value=(90,80)) as paths, \
              mock.patch.object(blancctl,'routes_healthy',side_effect=[False,True]) as routes, \
              mock.patch.object(blancctl,'service') as service, \
              mock.patch.object(blancctl,'select') as select, \
              contextlib.redirect_stdout(io.StringIO()):
             blancctl.failover(None)
         self.assertEqual(routes.call_count,2)
-        self.assertEqual(pingtest.call_count,2)
+        pingtest.assert_called_once()
+        paths.assert_called_once()
         service.assert_called_once_with('restart')
         select.assert_not_called()
+
+    def test_failover_repairs_failed_tun_data_path_after_repeated_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=pathlib.Path(tmp)
+            with mock.patch.multiple(blancctl,FAILOVER=root/'failover.json',PICK=root/'selected.json'), \
+                 mock.patch.object(blancctl.subprocess,'run',
+                                   return_value=subprocess.CompletedProcess([],0)), \
+                 mock.patch.object(blancctl,'try_operation_lock',
+                                   side_effect=lambda:contextlib.nullcontext(True)), \
+                 mock.patch.object(blancctl,'pingtest',return_value=90), \
+                 mock.patch.object(blancctl,'tun_pingtest',return_value=None), \
+                 mock.patch.object(blancctl,'live_paths',return_value=(90,80)), \
+                 mock.patch.object(blancctl,'routes_healthy',return_value=True), \
+                 mock.patch.object(blancctl,'service') as service, \
+                 mock.patch.dict(blancctl.os.environ,{'BLANCCTL_FAILOVER_FAILURES':'2'}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                blancctl.save(blancctl.PICK,{'id':'same-node'})
+                blancctl.failover(None)
+                service.assert_not_called()
+                self.assertEqual(blancctl.load(blancctl.FAILOVER,{})['tun_failures'],1)
+                blancctl.failover(None)
+                service.assert_called_once_with('restart')
+                self.assertEqual(blancctl.load(blancctl.FAILOVER,{})['tun_failures'],0)
+
+    def test_failover_retries_current_server_before_switching(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=pathlib.Path(tmp)
+            with mock.patch.multiple(blancctl,FAILOVER=root/'failover.json',PICK=root/'selected.json'), \
+                 mock.patch.object(blancctl.subprocess,'run',
+                                   return_value=subprocess.CompletedProcess([],0)), \
+                 mock.patch.object(blancctl,'try_operation_lock',
+                                   side_effect=lambda:contextlib.nullcontext(True)), \
+                 mock.patch.object(blancctl,'pingtest',return_value=None), \
+                 mock.patch.object(blancctl,'routes_healthy',return_value=True), \
+                 mock.patch.object(blancctl,'live_paths',return_value=(80,90)), \
+                 mock.patch.object(blancctl,'service') as service, \
+                 mock.patch.object(blancctl,'cached_nodes') as candidates, \
+                 mock.patch.dict(blancctl.os.environ,{'BLANCCTL_FAILOVER_FAILURES':'1'}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                blancctl.save(blancctl.PICK,{'id':'same-node'})
+                blancctl.failover(None)
+                self.assertEqual(blancctl.load(blancctl.FAILOVER,{})['failures'],0)
+        service.assert_called_once_with('restart')
+        candidates.assert_not_called()
 
     def test_tun_route_repair_has_a_cooldown(self):
         recent={'route_repair_at':int(blancctl.time.time()),'failures':0}
@@ -583,9 +694,13 @@ class NodeCacheTests(unittest.TestCase):
 
     def test_tun_route_health_checks_both_policy_rules_and_routes(self):
         def ip(args, **_):
-            value='1042: from all lookup 4269\n' if args[2]=='rule' else 'default dev blanc0 scope link\n'
+            value=('1041: from all fwmark 0x10ad lookup main\n1042: from all lookup 4269\n'
+                   if args[2]=='rule' else ('default dev blanc0 scope link\n'
+                    'throw 203.0.113.9\n'))
             return subprocess.CompletedProcess(args,0,stdout=value)
+        config={'outbounds':[{'tag':'proxy','settings':{'vnext':[{'address':'203.0.113.9'}]}}]}
         with mock.patch.object(blancctl.pathlib.Path,'exists',return_value=True), \
+             mock.patch.object(blancctl,'load',return_value=config), \
              mock.patch.object(blancctl.subprocess,'run',side_effect=ip) as run:
             self.assertTrue(blancctl.routes_healthy())
         self.assertEqual(run.call_count,4)
@@ -767,6 +882,25 @@ class NodeCacheTests(unittest.TestCase):
         blancctl.log_event.assert_any_call('curl_probe',status='ok',exit_code=0,
                                            http_codes='204-200-403-200',sites=4)
 
+    def test_tun_probe_bypasses_application_proxy_not_system_route(self):
+        response=subprocess.CompletedProcess([],0,stdout='0 204 0.1\n',stderr='')
+        with mock.patch.object(blancctl.subprocess,'run',return_value=response) as run:
+            values=blancctl.probe_urls(None,('https://example.test/',),4)
+        self.assertEqual(values,[100.0])
+        self.assertIn('--noproxy',run.call_args.args[0])
+        self.assertNotIn('--proxy',run.call_args.args[0])
+
+    def test_status_reports_failed_tun_even_when_socks_works(self):
+        with mock.patch.object(blancctl.subprocess,'run',
+                               return_value=subprocess.CompletedProcess([],0)), \
+             mock.patch.object(blancctl,'routes_healthy',return_value=True), \
+             mock.patch.object(blancctl,'live_paths',return_value=(80,None)), \
+             mock.patch.object(blancctl,'speedtest') as speed, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            blancctl.status(None)
+        self.assertIn('TUN data path unavailable',output.getvalue())
+        speed.assert_not_called()
+
     def test_live_health_accepts_any_successful_site(self):
         with mock.patch.object(blancctl, 'probe_urls', return_value=[None, 230, None, None]):
             self.assertEqual(blancctl.pingtest(5), 230)
@@ -784,6 +918,8 @@ class NodeCacheTests(unittest.TestCase):
         self.assertEqual(config['routing']['rules'][0]['ip'], ['geoip:private'])
         self.assertNotIn('geoip:ru', str(config['routing']))
         self.assertNotIn('ru|xn--p1ai', str(config['routing']))
+        self.assertEqual(config['outbounds'][0]['streamSettings']['sockopt']['mark'],4269)
+        self.assertEqual(config['outbounds'][1]['streamSettings']['sockopt']['mark'],4269)
 
     def test_xhttp_link_preserves_mode_extra_and_download_interface(self):
         extra='{"downloadSettings":{"address":"download.example","port":443,"network":"xhttp","xhttpSettings":{"path":"/down"}}}'
@@ -881,7 +1017,8 @@ class NodeCacheTests(unittest.TestCase):
                  mock.patch.object(blancctl.subprocess, 'run',
                                    return_value=subprocess.CompletedProcess([], 0)), \
                  mock.patch.object(blancctl, 'service') as service, \
-                 mock.patch.object(blancctl, 'pingtest', return_value=None), \
+                 mock.patch.object(blancctl, 'routes_healthy', return_value=True), \
+                 mock.patch.object(blancctl, 'live_paths', return_value=(100,None)), \
                  mock.patch.dict(blancctl.os.environ, {'BLANCCTL_NO_SERVICE':'0'}), \
                  contextlib.redirect_stderr(io.StringIO()), \
                  self.assertRaises(SystemExit):

@@ -31,8 +31,11 @@ case "${1:-}" in
     log)
         exec /usr/bin/journalctl -u blancctl.service -u blancctl-failover.service -n 200 --no-pager --output=short-precise
         ;;
+    routes)
+        exec "${BASH_SOURCE[0]%/*}/tun-route" refresh
+        ;;
     *)
-        echo "usage: service-control {check|start|stop|restart|status|log}" >&2
+        echo "usage: service-control {check|start|stop|restart|status|log|routes}" >&2
         exit 2
         ;;
 esac

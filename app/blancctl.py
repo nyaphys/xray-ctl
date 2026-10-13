@@ -29,8 +29,9 @@ DEFAULT_WORKERS = min(32, max(16, (os.cpu_count() or 8)*2))
 DEFAULT_PROBE_TIMEOUT = 8
 SPEED_CANDIDATES = 4
 SPEED_GAIN_THRESHOLD = 1.3
+ROUTE_MARK = 4269
 COLOR = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
-VERSION = "0.6.4"
+VERSION = "0.6.9"
 DEFAULT_DIRECT_DOMAINS = ('domain:cldom.ru',)
 LOG_LIMIT = 2 * 1024 * 1024
 LOG_BACKUPS = 4
@@ -365,11 +366,13 @@ def physical_interface():
         fields=line.split()
         if 'dev' in fields: return fields[fields.index('dev')+1]
     die("no physical default network interface found")
-def outbound(n,interface=None):
+def outbound(n,interface=None,mark=None):
     user={'id':n['uuid'],'encryption':n['encryption']}
     if n['flow']: user['flow']=n['flow']
     network='xhttp' if n['network']=='splithttp' else n['network']
     stream={'network':network,'security':n['security']}
+    transport_sockopt={'interface':interface} if interface else {}
+    if mark is not None: transport_sockopt['mark']=mark
     if n['security']=='reality': stream['realitySettings']={'serverName':n['sni'],'fingerprint':n['fingerprint'],'publicKey':n['public_key'],'shortId':n['short_id'],'spiderX':n.get('spider_x','')}
     elif n['security']=='tls':
         tls={'serverName':n['sni'],'fingerprint':n['fingerprint']}
@@ -385,10 +388,10 @@ def outbound(n,interface=None):
         if n.get('mode'): xhttp['mode']=n['mode']
         if n.get('extra'):
             extra=json.loads(n['extra'])
-            if interface and isinstance(extra.get('downloadSettings'),dict):
+            if transport_sockopt and isinstance(extra.get('downloadSettings'),dict):
                 download=extra['downloadSettings']
                 sockopt=download.get('sockopt')
-                download['sockopt']={**sockopt,'interface':interface} if isinstance(sockopt,dict) else {'interface':interface}
+                download['sockopt']={**sockopt,**transport_sockopt} if isinstance(sockopt,dict) else dict(transport_sockopt)
             xhttp['extra']=extra
         stream['xhttpSettings']=xhttp
     elif network=='grpc':
@@ -397,7 +400,7 @@ def outbound(n,interface=None):
         stream['grpcSettings']=grpc
     elif network=='httpupgrade':
         stream['httpupgradeSettings']={'path':n['path'],'host':n['host']}
-    if interface: stream['sockopt']={'interface':interface}
+    if transport_sockopt: stream['sockopt']=transport_sockopt
     return {'tag':'proxy','protocol':'vless','settings':{'vnext':[{'address':n['address'],'port':n['port'],'users':[user]}]},
       'streamSettings':stream}
 def normalize_route_value(kind,value):
@@ -494,7 +497,9 @@ def diagnose_route(domain):
         for name,job in jobs.items(): print(f'{name}: {job.result()}')
     print('These HTTP probes do not test browser subresources, QUIC, or a hidden SNI.')
 def tun(n):
-    interface=physical_interface(); direct={'tag':'direct','protocol':'freedom','streamSettings':{'sockopt':{'interface':interface}}}
+    interface=physical_interface()
+    direct={'tag':'direct','protocol':'freedom',
+            'streamSettings':{'sockopt':{'interface':interface,'mark':ROUTE_MARK}}}
     sniffing={'enabled':True,'destOverride':['http','tls','quic'],'routeOnly':True}
     return {'log':{'loglevel':'warning'},'dns':{'servers':['1.1.1.1','8.8.8.8','localhost']},
       'inbounds':[{'tag':'tun-in','protocol':'tun','settings':{'name':'blanc0','mtu':1400,
@@ -502,7 +507,7 @@ def tun(n):
        'sniffing':sniffing},
        {'tag':'socks-in','listen':'127.0.0.1','port':10808,'protocol':'socks','settings':{'udp':True},
         'sniffing':sniffing}],
-      'outbounds':[outbound(n,interface),direct,{'tag':'block','protocol':'blackhole'}],
+      'outbounds':[outbound(n,interface,ROUTE_MARK),direct,{'tag':'block','protocol':'blackhole'}],
       'routing':{'domainStrategy':'AsIs','rules':routing_rules()}}
 def socks(n,port,interface=None):
     return {'log':{'loglevel':'none'},'inbounds':[{'listen':'127.0.0.1','port':port,'protocol':'socks','settings':{'udp':True}}],
@@ -512,10 +517,11 @@ def port():
 def probe_urls(proxy,urls,timeout):
     connect_timeout=min(timeout,2.5)
     command=['curl','-sS','-L','--range','0-0','--max-redirs','3',
-      '-A','Mozilla/5.0','--proxy',proxy,
+      '-A','Mozilla/5.0',
       '--connect-timeout',str(connect_timeout),'--max-time',str(timeout),'--parallel',
       '--parallel-immediate','--parallel-max',str(len(urls)),
       '-w','%{urlnum} %{http_code} %{time_starttransfer}\n']
+    command.extend(('--proxy',proxy,'--noproxy','') if proxy else ('--noproxy','*'))
     for url in urls: command.extend(('-o','/dev/null',url))
     try:
         r=subprocess.run(command,capture_output=True,text=True,timeout=timeout+2)
@@ -690,6 +696,19 @@ def pingtest(timeout=10):
     log_event('live_probe',status='ok' if successful else 'failed',latency_ms=latency,
               sites=''.join('1' if v is not None else '0' for v in values),timeout_ms=round(timeout*1000))
     return latency
+def tun_pingtest(timeout=10):
+    """Check the kernel/TUN path, not only the local SOCKS listener."""
+    values=probe_urls(None,TEST_URLS,timeout)
+    successful=[value for value in values if value is not None]
+    latency=round(min(successful),1) if successful else None
+    log_event('tun_probe',status='ok' if successful else 'failed',latency_ms=latency,
+              sites=''.join('1' if v is not None else '0' for v in values),timeout_ms=round(timeout*1000))
+    return latency
+def live_paths(timeout):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        socks=pool.submit(pingtest,timeout)
+        tun_path=pool.submit(tun_pingtest,timeout)
+        return socks.result(),tun_path.result()
 def routes_healthy():
     if not pathlib.Path('/sys/class/net/blanc0').exists():
         log_event('route_check',status='failed',reason='missing_interface')
@@ -704,12 +723,27 @@ def routes_healthy():
             log_event('route_check',status='failed',family=family_name,reason='ip_command',
                       rule_exit=rules.returncode,route_exit=routes.returncode)
             return False
-        if 'lookup 4269' not in (rules.stdout or ''):
+        rule_text=rules.stdout or ''
+        if 'lookup 4269' not in rule_text:
             log_event('route_check',status='failed',family=family_name,reason='missing_rule')
+            return False
+        if not re.search(rf'fwmark (?:0x)?{ROUTE_MARK:x}(?:/0xffffffff)? lookup main',rule_text):
+            log_event('route_check',status='failed',family=family_name,reason='missing_mark_bypass')
             return False
         if not any(line.split()[:3]==['default','dev','blanc0'] for line in (routes.stdout or '').splitlines()):
             log_event('route_check',status='failed',family=family_name,reason='missing_default')
             return False
+        try:
+            proxy=next(o for o in load(CONF,{}).get('outbounds',[]) if o.get('tag')=='proxy')
+            endpoint=proxy['settings']['vnext'][0]['address']
+            endpoint_ip=ipaddress.ip_address(endpoint)
+        except (StopIteration,KeyError,IndexError,TypeError,ValueError):
+            endpoint_ip=None
+        if endpoint_ip is not None and endpoint_ip.version==(4 if family=='-4' else 6):
+            if not any(line.split()[:2]==['throw',str(endpoint_ip)]
+                       for line in (routes.stdout or '').splitlines()):
+                log_event('route_check',status='failed',family=family_name,reason='missing_endpoint_bypass')
+                return False
     return True
 def failover(_):
     threshold=max(1,int(os.getenv('BLANCCTL_FAILOVER_FAILURES','3')))
@@ -720,7 +754,7 @@ def failover(_):
         failed=subprocess.run(['systemctl','is-failed','--quiet','blancctl.service']).returncode==0
         if not failed:
             log_event('failover',status='stopped')
-            print("BlancVPN is stopped; skipping this failover check.")
+            print("The VPN is stopped; skipping this failover check.")
             return
         with try_operation_lock() as available:
             if not available:
@@ -728,7 +762,7 @@ def failover(_):
                 return
             if subprocess.run(['systemctl','is-failed','--quiet','blancctl.service']).returncode==0:
                 log_event('failover',status='service_failed',action='restart')
-                print("BlancVPN service failed; attempting to restart it.")
+                print("The VPN service failed; attempting to restart it.")
                 try: service('restart')
                 except SystemExit:
                     log_event('failover',status='restart_failed')
@@ -769,22 +803,75 @@ def failover(_):
                     log_event('failover',status='route_repair_failed')
                     print("TUN route repair failed; will retry later.")
                     return
-            if not routes_healthy() or pingtest(timeout) is None:
+            if not routes_healthy() or any(value is None for value in live_paths(timeout)):
                 log_event('failover',status='route_still_missing')
                 print("TUN route remains unavailable after restart; will retry later.")
+                return
+        tun_latency=tun_pingtest(timeout)
+        if tun_latency is None:
+            failures=state.get('tun_failures',0)+1
+            save(FAILOVER,{**state,'tun_failures':failures,'checked_at':int(time.time())})
+            log_event('failover',status='tun_probe_failed',failures=failures,threshold=threshold)
+            if failures<threshold:
+                print(f"TUN path failed ({failures}/{threshold}); keeping the current server.")
+                return
+            now=int(time.time())
+            if now-state.get('route_repair_at',0)<120:
+                print("TUN path is still unavailable; waiting before another repair attempt.")
+                return
+            with try_operation_lock() as available:
+                if not available:
+                    print("Configuration operation in progress; deferring TUN repair.")
+                    return
+                if load(PICK,{}).get('id')!=selected.get('id'):
+                    print("Connection changed during the check; deferring TUN repair.")
+                    return
+                save(FAILOVER,{**state,'route_repair_at':now,'tun_failures':failures,'checked_at':now})
+                log_event('failover',status='tun_repair',action='restart')
+                try: service('restart')
+                except SystemExit:
+                    log_event('failover',status='tun_repair_failed')
+                    return
+            if not routes_healthy() or any(value is None for value in live_paths(timeout)):
+                log_event('failover',status='tun_still_unavailable')
+                print("TUN path remains unavailable after restart; will retry later.")
                 return
         if state.get('failures',0):
             log_event('failover',status='recovered',latency_ms=latency)
             print(f"Connection recovered: {latency:.0f} ms")
-        save(FAILOVER,{**state,'failures':0,'checked_at':int(time.time())})
+        save(FAILOVER,{**state,'failures':0,'tun_failures':0,'checked_at':int(time.time())})
         return
     failures=threshold if disabled_current or failed else state.get('failures',0)+1
     log_event('failover',status='health_failed',failures=failures,threshold=threshold,
               service_active=active,disabled_current=disabled_current)
-    save(FAILOVER,{'failures':failures,'checked_at':int(time.time())})
+    save(FAILOVER,{**state,'failures':failures,'tun_failures':0,'checked_at':int(time.time())})
     if failures < threshold:
         print(f"Health check failed ({failures}/{threshold}); keeping the current server.")
         return
+    now=int(time.time())
+    if active and not disabled_current and now-state.get('connection_repair_at',0)>=120:
+        with try_operation_lock() as available:
+            if not available:
+                print("Configuration operation in progress; deferring connection repair.")
+                return
+            if load(PICK,{}).get('id')!=selected.get('id'):
+                print("Connection changed during the check; deferring connection repair.")
+                return
+            if subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode!=0:
+                print("The VPN was stopped during the check; not reconnecting.")
+                return
+            save(FAILOVER,{**state,'failures':failures,'tun_failures':0,
+                           'connection_repair_at':now,'checked_at':now})
+            log_event('failover',status='connection_repair',action='restart')
+            try: service('restart')
+            except SystemExit: log_event('failover',status='connection_repair_failed')
+            else:
+                if routes_healthy() and all(value is not None for value in live_paths(timeout)):
+                    save(FAILOVER,{**state,'failures':0,'tun_failures':0,
+                                   'connection_repair_at':now,'checked_at':int(time.time())})
+                    log_event('failover',status='reconnected_current')
+                    print("The current server recovered after restart; no switch was needed.")
+                    return
     current,retained=cached_nodes()
     ns=selectable_nodes(current+retained)
     if not ns: die("failover has no enabled cached servers; Russia endpoints are disabled")
@@ -798,6 +885,14 @@ def failover(_):
     print(f"{reason}; testing {len(candidates)} alternatives…")
     if not candidates:
         print("No alternative cached server is available; will retry later.")
+        return
+    # Candidate Xray processes run alongside the catch-all TUN. Refresh their
+    # endpoint throw routes first so probes go over the physical network rather
+    # than being chained through the currently selected VPN.
+    try: service('routes')
+    except SystemExit:
+        log_event('failover',status='probe_routes_failed')
+        print("Could not prepare direct routes for candidate servers; will retry later.")
         return
     working=[]
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8,len(candidates))) as pool:
@@ -820,7 +915,7 @@ def failover(_):
                 return
             now_active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
             if not now_active and subprocess.run(['systemctl','is-failed','--quiet','blancctl.service']).returncode!=0:
-                print("BlancVPN was stopped during the check; not reconnecting.")
+                print("The VPN was stopped during the check; not reconnecting.")
                 return
             recovered_latency=None if disabled_current or not now_active else pingtest(timeout)
             if recovered_latency is not None:
@@ -966,8 +1061,16 @@ def select(n,restart=True,ping=None,speed=None,force=False):
     if restart:
         try:
             service('restart')
-            if os.getenv('BLANCCTL_NO_SERVICE')!='1' and pingtest(5.5) is None:
-                raise ConnectionError("new server did not pass a live connectivity check")
+            if os.getenv('BLANCCTL_NO_SERVICE')!='1':
+                route_ok=routes_healthy()
+                live_timeout=adaptive_timeout(ping,10.0)
+                socks_latency,tun_latency=live_paths(live_timeout)
+                failed=[]
+                if not route_ok: failed.append('routes')
+                if socks_latency is None: failed.append('SOCKS')
+                if tun_latency is None: failed.append('TUN')
+                if failed:
+                    raise ConnectionError("new server failed live check: "+', '.join(failed))
         except (SystemExit,ConnectionError) as failure:
             log_event('selection',status='rollback',node_id=n['id'],
                       reason='live_probe' if isinstance(failure,ConnectionError) else 'restart')
@@ -1012,6 +1115,7 @@ def bycountry(a):
         if any(matches(n) and disabled_node(n) for n in current+retained):
             die("Russia endpoints are disabled; no connection was changed")
         die("country not found")
+    service('routes')
     n,r=benchmark_choice(ns,a.workers,a.timeout,fallback)
     select(n,ping=r[n['id']])
 def refresh(_):
@@ -1095,6 +1199,7 @@ def allbest(a):
     ns=current or retained
     if current and selected_backup: ns=current+[selected_backup]
     fallback=[n for n in retained if n is not selected_backup] if current else []
+    service('routes')
     n,r=benchmark_choice(ns,a.workers,a.timeout,fallback)
     select(n,ping=r[n['id']])
 def subscription(a):
@@ -1175,15 +1280,23 @@ def route(a):
 def status(_):
     active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
     pick=load(PICK,{}); stats=load(STATS,{})
-    if not active: print(f"{paint('2','○ BlancVPN')}  {paint('31','off')}"); return
+    if not active: print(f"{paint('2','○ xray-ctl')}  {paint('31','off')}"); return
     if not routes_healthy():
-        print(f"{paint('1;31','! BlancVPN')}  {paint('33','route unavailable')} · run: xray-ctl log"); return
+        print(f"{paint('1;31','! xray-ctl')}  {paint('33','route unavailable')} · run: xray-ctl log"); return
     place=' '.join(x for x in (pick.get('country_code'),pick.get('country')) if x) or 'unknown'
-    ping_value=pingtest(); speed_value=speedtest() if ping_value is not None else None
-    stats={'ping_ms':ping_value,'speed_mbps':speed_value,'tested_at':int(time.time())}; save(STATS,stats)
+    ping_value,tun_value=live_paths(8)
+    if tun_value is None:
+        print(f"{paint('1;31','! xray-ctl')}  {paint('33','TUN data path unavailable')} · run: xray-ctl log")
+        return
+    if ping_value is None:
+        print(f"{paint('1;31','! xray-ctl')}  {paint('33','SOCKS data path unavailable')} · run: xray-ctl log")
+        return
+    speed_value=speedtest()
+    stats={'ping_ms':ping_value,'tun_ms':tun_value,'speed_mbps':speed_value,
+           'tested_at':int(time.time())}; save(STATS,stats)
     ping=f"{ping_value:.0f} ms" if ping_value is not None else f"ping {paint('31','n/a')}"
     speed=f"{speed_value:.1f} Mbps" if speed_value is not None else f"speed {paint('31','n/a')}"
-    print(f"{paint('32','● BlancVPN')}  {paint('36',place)} · {ping} · {speed}")
+    print(f"{paint('32','● xray-ctl')}  {paint('36',place)} · {ping} · {speed}")
 def logs(a):
     if a.service:
         service('log')

@@ -21,7 +21,7 @@ in
     user = lib.mkOption {
       type = lib.types.str;
       example = "alice";
-      description = "Normal user allowed to configure and control BlancVPN.";
+      description = "Normal user allowed to configure and control xray-ctl.";
     };
 
     group = lib.mkOption {
@@ -97,15 +97,16 @@ in
       ${cfg.user} ALL=(root) NOPASSWD: ${control} restart
       ${cfg.user} ALL=(root) NOPASSWD: ${control} status
       ${cfg.user} ALL=(root) NOPASSWD: ${control} log
+      ${cfg.user} ALL=(root) NOPASSWD: ${control} routes
     '';
 
     systemd.services.blancctl = {
-      description = "BlancVPN Xray TUN";
+      description = "xray-ctl Xray TUN";
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = lib.optionals cfg.autoStart [ "multi-user.target" ];
       unitConfig.ConditionPathExists = "${stateDirectory}/xray.json";
-      path = [ cfg.package pkgs.coreutils pkgs.curl pkgs.iproute2 pkgs.systemd pkgs.xray ];
+      path = [ cfg.package pkgs.coreutils pkgs.curl pkgs.glibc.getent pkgs.iproute2 pkgs.systemd pkgs.xray ];
       serviceConfig = {
         Type = "simple";
         User = cfg.user;
@@ -126,7 +127,7 @@ in
     };
 
     systemd.services."blancctl-failover" = lib.mkIf cfg.failover.enable {
-      description = "BlancVPN connectivity check and automatic failover";
+      description = "xray-ctl connectivity check and automatic failover";
       after = [ "network-online.target" "blancctl.service" ];
       wants = [ "network-online.target" ];
       path = [ cfg.package pkgs.coreutils pkgs.curl pkgs.iproute2 pkgs.systemd pkgs.xray ];
@@ -149,7 +150,7 @@ in
     };
 
     systemd.timers."blancctl-failover" = lib.mkIf cfg.failover.enable {
-      description = "Check BlancVPN connectivity periodically";
+      description = "Check xray-ctl connectivity periodically";
       wantedBy = [ "timers.target" ];
       timerConfig = {
         OnBootSec = "45s";
