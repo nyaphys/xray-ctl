@@ -193,6 +193,12 @@ routing; see the [diagnostic procedure](docs/split-tunneling.md).
 after releasing its configuration lock. The command does not wait for that
 download; `update-status` shows whether it completed. `best --refresh` still
 downloads before testing when the new servers must be included immediately.
+If no cached candidate passes the final live SOCKS and TUN checks, `best`
+tries the other responsive profiles and retained backups, then performs one
+immediate subscription refresh and retests the refreshed cache. This emergency
+download tries the current SOCKS path first and, if it fails, binds curl to
+the physical network interface. The normal background refresh is skipped when
+the emergency refresh has already run.
 Russia (RU) endpoints remain in the private subscription/cache for recovery,
 but are excluded from `best`, failover, automatic start, `country` selection,
 and the `countries` list. Installing a new version does not interrupt an
@@ -219,9 +225,15 @@ still measures live download speed separately. After a switch, `xray-ctl`
 checks both the running SOCKS path and the system TUN path; if either fails, it
 restores the previous configuration and restarts the previous connection. If
 the already-running server and generated configuration are unchanged, `best`
-keeps that connection instead of restarting it.
+first checks its live SOCKS path, TUN path, and policy routes. It keeps the
+connection without a restart only when all three checks pass. Otherwise it
+restarts the current server once and verifies all three paths again; a failed
+repair is reported instead of printing a false `Already using` success.
+Profiles that pass a temporary benchmark but fail after activation do not end
+the search: `best` tries the remaining responsive profiles in endpoint-diverse
+order. Activation is sequential because the service has one TUN interface.
 
-Before testing, 0.6.9 refreshes host `throw` routes for every cached VPN
+Before testing, 0.6.11 refreshes host `throw` routes for every cached VPN
 endpoint. This is required while the catch-all TUN is already active: without
 those routes, a temporary candidate Xray can be chained through the currently
 selected VPN and the benchmark no longer measures that candidate directly.
@@ -267,13 +279,16 @@ NekoBox, `xray-ctl` does not use sing-box, and carrier-specific Extra profiles
 still depend on the subscription settings enabled by the provider.
 
 Automatic monitoring is enabled by `xray-ctl-setup` on Arch and by default in
-the NixOS module. In 0.6.9, `blancctl-failover.timer` checks both live SOCKS
+the NixOS module. In 0.6.11, `blancctl-failover.timer` checks both live SOCKS
 and ordinary TUN traffic against the four control sites after each 30-second
 interval. A transient failure keeps the current node. After repeated SOCKS
-failures, it first retries the same server, then tests up to six distinct
+failures, it first retries the same server, then tests up to 16 distinct
 cached alternatives in parallel, prioritizing site coverage and latency.
 If SOCKS works but the TUN route or data path fails, the timer repairs that
-path without switching nodes. Repairs have a cooldown to avoid restart loops.
+path first. If repair fails, it searches alternatives and refreshes subscriptions
+once if the cache has none that work. Emergency refreshes have a five-minute
+cooldown; a healthy SOCKS listener alone cannot stop a TUN failover. Repairs
+have a cooldown to avoid restart loops.
 This checks connectivity, not every browser subresource or every user rule;
 use `route test DOMAIN` for a particular site. Endpoint probes do not hold the
 configuration lock; the lock is taken only while changing the selected server.

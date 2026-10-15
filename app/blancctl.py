@@ -31,7 +31,7 @@ SPEED_CANDIDATES = 4
 SPEED_GAIN_THRESHOLD = 1.3
 ROUTE_MARK = 4269
 COLOR = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
-VERSION = "0.6.9"
+VERSION = "0.6.11"
 DEFAULT_DIRECT_DOMAINS = ('domain:cldom.ru',)
 LOG_LIMIT = 2 * 1024 * 1024
 LOG_BACKUPS = 4
@@ -252,21 +252,44 @@ def download_limits():
     previous=load(DOWNLOAD,{}).get('seconds')
     if not isinstance(previous,(int,float)) or not math.isfinite(previous) or previous<=0: return 2.5,8
     return round(min(4,max(2,previous*.75+1)),1),round(min(12,max(5,previous*1.75+2)),1)
-def download_source(name,url,connect_timeout,total_timeout):
-    proxy=[]
+def download_source(name,url,connect_timeout,total_timeout,emergency=False):
+    proxy_available=False
     try:
-        with socket.create_connection(('127.0.0.1',10808),.2): proxy=['--proxy',LOCAL_PROXY]
+        with socket.create_connection(('127.0.0.1',10808),.2): proxy_available=True
     except OSError: pass
-    try:
-        r=subprocess.run(['curl','--fail','--location','--silent','--show-error',
-          '--connect-timeout',str(connect_timeout),'--max-time',str(total_timeout),
-          '--max-filesize',str(8*1024*1024),'-A','v2rayN/7.0',*proxy,url],
-          capture_output=True,timeout=total_timeout+2)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("download timed out") from None
-    if r.returncode:
+    paths=['proxy'] if proxy_available else ['physical']
+    if emergency and proxy_available: paths.append('physical')
+    errors=[]
+    for path in paths:
+        if path=='proxy': route=['--noproxy','','--proxy',LOCAL_PROXY]
+        else:
+            interface=physical_interface(required=False)
+            if interface is None:
+                errors.append('physical route unavailable')
+                log_event('subscription_download_path',source_id=source_log_id(name),
+                          path=path,status='unavailable')
+                continue
+            route=['--noproxy','*','--interface',interface]
+        try:
+            r=subprocess.run(['curl','--fail','--location','--silent','--show-error',
+              '--connect-timeout',str(connect_timeout),'--max-time',str(total_timeout),
+              '--max-filesize',str(8*1024*1024),'-A','v2rayN/7.0',*route,url],
+              capture_output=True,timeout=total_timeout+2)
+        except subprocess.TimeoutExpired:
+            errors.append(f'{path} timeout')
+            log_event('subscription_download_path',source_id=source_log_id(name),
+                      path=path,status='timeout')
+            continue
+        if r.returncode==0:
+            log_event('subscription_download_path',source_id=source_log_id(name),
+                      path=path,status='ok')
+            break
         reason={22:'HTTP error',28:'timeout'}.get(r.returncode,'network error')
-        raise RuntimeError(f"{reason} (curl exit {r.returncode})")
+        errors.append(f'{path} {reason} (curl exit {r.returncode})')
+        log_event('subscription_download_path',source_id=source_log_id(name),
+                  path=path,status='failed',exit_code=r.returncode)
+    else:
+        raise RuntimeError('; '.join(errors))
     raw=r.stdout
     if len(raw)>8*1024*1024: raise RuntimeError("subscription is larger than 8 MiB")
     raw_text=raw.decode(errors='replace')
@@ -283,14 +306,14 @@ def download_source(name,url,connect_timeout,total_timeout):
             out.append(node)
         except ValueError: unparsed+=1
     return out,text,unparsed
-def update(url=None,replace=False):
+def update(url=None,replace=False,emergency=False):
     sources={'default':url} if url is not None else subscription_sources()
     if not sources: die("no subscriptions configured; use: xray-ctl subscription add NAME URL")
     connect_timeout,total_timeout=download_limits()
     started=time.monotonic()
     fetched=[]; failed={}; unparsed=0; succeeded=0
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8,len(sources))) as pool:
-        futures={pool.submit(download_source,name,source,connect_timeout,total_timeout):name
+        futures={pool.submit(download_source,name,source,connect_timeout,total_timeout,emergency):name
                  for name,source in sources.items()}
         for future in concurrent.futures.as_completed(futures):
             name=futures[future]
@@ -360,12 +383,13 @@ def nodes():
         updated=update()
         return [n for n in updated if not n.get('stale')]
     return current or retained
-def physical_interface():
+def physical_interface(required=True):
     r=subprocess.run(['ip','-4','route','show','default'],capture_output=True,text=True)
     for line in r.stdout.splitlines():
         fields=line.split()
         if 'dev' in fields: return fields[fields.index('dev')+1]
-    die("no physical default network interface found")
+    if required: die("no physical default network interface found")
+    return None
 def outbound(n,interface=None,mark=None):
     user={'id':n['uuid'],'encryption':n['encryption']}
     if n['flow']: user['flow']=n['flow']
@@ -745,10 +769,60 @@ def routes_healthy():
                 log_event('route_check',status='failed',family=family_name,reason='missing_endpoint_bypass')
                 return False
     return True
+def failover_candidates(candidates,selected,disabled_current,timeout):
+    if not candidates: return 'none'
+    # Candidate processes must reach their endpoints through the physical network.
+    try: service('routes')
+    except SystemExit:
+        log_event('failover',status='probe_routes_failed')
+        print("Could not prepare direct routes for candidate servers; will retry later.")
+        return 'deferred'
+    working=[]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8,len(candidates))) as pool:
+        probes={pool.submit(test,n,timeout,urls=TEST_URLS):n for n in candidates}
+        for future in concurrent.futures.as_completed(probes):
+            try: _,candidate_latency,sites=future.result()
+            except Exception as exc:
+                log_exception('failover_candidate_error',exc,node_id=probes[future]['id'])
+                continue
+            if candidate_latency is not None:
+                working.append((probes[future],candidate_latency,sum(value is not None for value in sites)))
+    working.sort(key=lambda item:(-item[2],item[1]))
+    for n,candidate_latency,_ in working:
+        with try_operation_lock() as available:
+            if not available:
+                print("Configuration operation started during the check; deferring failover.")
+                return 'deferred'
+            if load(PICK,{}).get('id')!=selected.get('id'):
+                print("Selected server changed during the check; deferring failover.")
+                return 'deferred'
+            now_active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
+            if not now_active and subprocess.run(['systemctl','is-failed','--quiet','blancctl.service']).returncode!=0:
+                print("The VPN was stopped during the check; not reconnecting.")
+                return 'deferred'
+            if not disabled_current and now_active and routes_healthy():
+                socks_latency,tun_latency=live_paths(timeout)
+                if socks_latency is not None and tun_latency is not None:
+                    log_event('failover',status='recovered_during_scan',latency_ms=socks_latency)
+                    print(f"Connection recovered during failover testing: {socks_latency:.0f} ms")
+                    save(FAILOVER,{'failures':0,'tun_failures':0,'checked_at':int(time.time())})
+                    return 'recovered'
+            print(f"Failing over to {n['label']} ({candidate_latency:.0f} ms).")
+            log_event('failover',status='switch_attempt',node_id=n['id'],latency_ms=candidate_latency)
+            try: select(n,ping=candidate_latency)
+            except SystemExit:
+                log_event('failover',status='switch_failed',node_id=n['id'])
+                print("Alternative failed its live check; trying the next cached server.")
+                continue
+            log_event('failover',status='switched',node_id=n['id'],latency_ms=candidate_latency)
+            save(FAILOVER,{'failures':0,'tun_failures':0,'checked_at':int(time.time()),
+                           'switched_at':int(time.time())})
+            return 'switched'
+    return 'none'
 def failover(_):
     threshold=max(1,int(os.getenv('BLANCCTL_FAILOVER_FAILURES','3')))
     timeout=max(1,float(os.getenv('BLANCCTL_FAILOVER_TIMEOUT','5')))
-    max_candidates=max(1,int(os.getenv('BLANCCTL_FAILOVER_CANDIDATES','6')))
+    max_candidates=max(1,int(os.getenv('BLANCCTL_FAILOVER_CANDIDATES','16')))
     active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
     if not active:
         failed=subprocess.run(['systemctl','is-failed','--quiet','blancctl.service']).returncode==0
@@ -779,36 +853,37 @@ def failover(_):
     selected=load(PICK,{})
     disabled_current=disabled_node(selected)
     latency=None if disabled_current or not active else pingtest(timeout)
+    repair_failed=False
     if latency is not None:
         if not routes_healthy():
             log_event('failover',status='route_missing')
             now=int(time.time())
             if now-state.get('route_repair_at',0)<120:
-                print("TUN route is still unavailable; waiting before another repair attempt.")
-                return
-            with try_operation_lock() as available:
-                if not available:
-                    print("Configuration operation in progress; deferring TUN route repair.")
-                    return
-                still_active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
-                if not still_active or load(PICK,{}).get('id')!=selected.get('id'):
-                    print("Connection changed during the check; deferring TUN route repair.")
-                    return
-                save(FAILOVER,{**state,'route_repair_at':now,'checked_at':now})
-                state['route_repair_at']=now
-                print("TUN route is unavailable; restarting Xray to restore it.")
-                log_event('failover',status='route_repair',action='restart')
-                try: service('restart')
-                except SystemExit:
-                    log_event('failover',status='route_repair_failed')
-                    print("TUN route repair failed; will retry later.")
-                    return
-            if not routes_healthy() or any(value is None for value in live_paths(timeout)):
-                log_event('failover',status='route_still_missing')
-                print("TUN route remains unavailable after restart; will retry later.")
-                return
-        tun_latency=tun_pingtest(timeout)
-        if tun_latency is None:
+                repair_failed=True
+                print("TUN route remains unavailable; checking alternative servers.")
+            else:
+                with try_operation_lock() as available:
+                    if not available:
+                        print("Configuration operation in progress; deferring TUN route repair.")
+                        return
+                    still_active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
+                    if not still_active or load(PICK,{}).get('id')!=selected.get('id'):
+                        print("Connection changed during the check; deferring TUN route repair.")
+                        return
+                    save(FAILOVER,{**state,'route_repair_at':now,'checked_at':now})
+                    state['route_repair_at']=now
+                    print("TUN route is unavailable; restarting Xray to restore it.")
+                    log_event('failover',status='route_repair',action='restart')
+                    try: service('restart')
+                    except SystemExit:
+                        log_event('failover',status='route_repair_failed')
+                        repair_failed=True
+                if not repair_failed and (not routes_healthy() or
+                                          any(value is None for value in live_paths(timeout))):
+                    log_event('failover',status='route_still_missing')
+                    repair_failed=True
+                    print("TUN route remains unavailable after restart; checking alternatives.")
+        if not repair_failed and tun_pingtest(timeout) is None:
             failures=state.get('tun_failures',0)+1
             save(FAILOVER,{**state,'tun_failures':failures,'checked_at':int(time.time())})
             log_event('failover',status='tun_probe_failed',failures=failures,threshold=threshold)
@@ -817,31 +892,35 @@ def failover(_):
                 return
             now=int(time.time())
             if now-state.get('route_repair_at',0)<120:
-                print("TUN path is still unavailable; waiting before another repair attempt.")
-                return
-            with try_operation_lock() as available:
-                if not available:
-                    print("Configuration operation in progress; deferring TUN repair.")
-                    return
-                if load(PICK,{}).get('id')!=selected.get('id'):
-                    print("Connection changed during the check; deferring TUN repair.")
-                    return
-                save(FAILOVER,{**state,'route_repair_at':now,'tun_failures':failures,'checked_at':now})
-                log_event('failover',status='tun_repair',action='restart')
-                try: service('restart')
-                except SystemExit:
-                    log_event('failover',status='tun_repair_failed')
-                    return
-            if not routes_healthy() or any(value is None for value in live_paths(timeout)):
-                log_event('failover',status='tun_still_unavailable')
-                print("TUN path remains unavailable after restart; will retry later.")
-                return
-        if state.get('failures',0):
-            log_event('failover',status='recovered',latency_ms=latency)
-            print(f"Connection recovered: {latency:.0f} ms")
-        save(FAILOVER,{**state,'failures':0,'tun_failures':0,'checked_at':int(time.time())})
-        return
-    failures=threshold if disabled_current or failed else state.get('failures',0)+1
+                repair_failed=True
+                print("TUN path remains unavailable; checking alternative servers.")
+            else:
+                with try_operation_lock() as available:
+                    if not available:
+                        print("Configuration operation in progress; deferring TUN repair.")
+                        return
+                    if load(PICK,{}).get('id')!=selected.get('id'):
+                        print("Connection changed during the check; deferring TUN repair.")
+                        return
+                    save(FAILOVER,{**state,'route_repair_at':now,'tun_failures':failures,'checked_at':now})
+                    state['route_repair_at']=now
+                    log_event('failover',status='tun_repair',action='restart')
+                    try: service('restart')
+                    except SystemExit:
+                        log_event('failover',status='tun_repair_failed')
+                        repair_failed=True
+                if not repair_failed and (not routes_healthy() or
+                                          any(value is None for value in live_paths(timeout))):
+                    log_event('failover',status='tun_still_unavailable')
+                    repair_failed=True
+                    print("TUN path remains unavailable after restart; checking alternatives.")
+        if not repair_failed:
+            if state.get('failures',0):
+                log_event('failover',status='recovered',latency_ms=latency)
+                print(f"Connection recovered: {latency:.0f} ms")
+            save(FAILOVER,{**state,'failures':0,'tun_failures':0,'checked_at':int(time.time())})
+            return
+    failures=threshold if disabled_current or failed or repair_failed else state.get('failures',0)+1
     log_event('failover',status='health_failed',failures=failures,threshold=threshold,
               service_active=active,disabled_current=disabled_current)
     save(FAILOVER,{**state,'failures':failures,'tun_failures':0,'checked_at':int(time.time())})
@@ -849,7 +928,7 @@ def failover(_):
         print(f"Health check failed ({failures}/{threshold}); keeping the current server.")
         return
     now=int(time.time())
-    if active and not disabled_current and now-state.get('connection_repair_at',0)>=120:
+    if active and not disabled_current and not repair_failed and now-state.get('connection_repair_at',0)>=120:
         with try_operation_lock() as available:
             if not available:
                 print("Configuration operation in progress; deferring connection repair.")
@@ -874,7 +953,6 @@ def failover(_):
                     return
     current,retained=cached_nodes()
     ns=selectable_nodes(current+retained)
-    if not ns: die("failover has no enabled cached servers; Russia endpoints are disabled")
     pings=load(PINGS,{})
     history=load(HISTORY,{})
     candidates=[n for n in ns if n['id']!=selected.get('id')]
@@ -883,58 +961,39 @@ def failover(_):
     candidates=diverse_candidates(candidates,max_candidates)
     reason="Selected Russia endpoint is disabled" if disabled_current else f"Current server failed {failures} checks"
     print(f"{reason}; testing {len(candidates)} alternatives…")
-    if not candidates:
-        print("No alternative cached server is available; will retry later.")
-        return
-    # Candidate Xray processes run alongside the catch-all TUN. Refresh their
-    # endpoint throw routes first so probes go over the physical network rather
-    # than being chained through the currently selected VPN.
-    try: service('routes')
-    except SystemExit:
-        log_event('failover',status='probe_routes_failed')
-        print("Could not prepare direct routes for candidate servers; will retry later.")
-        return
-    working=[]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8,len(candidates))) as pool:
-        probes={pool.submit(test,n,timeout,urls=TEST_URLS):n for n in candidates}
-        for future in concurrent.futures.as_completed(probes):
-            try: _,candidate_latency,sites=future.result()
-            except Exception as exc:
-                log_exception('failover_candidate_error',exc,node_id=probes[future]['id'])
-                continue
-            if candidate_latency is not None:
-                working.append((probes[future],candidate_latency,sum(value is not None for value in sites)))
-    working.sort(key=lambda item:(-item[2],item[1]))
-    for n,candidate_latency,_ in working:
-        with try_operation_lock() as available:
-            if not available:
-                print("Configuration operation started during the check; deferring failover.")
-                return
-            if load(PICK,{}).get('id')!=selected.get('id'):
-                print("Selected server changed during the check; deferring failover.")
-                return
-            now_active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
-            if not now_active and subprocess.run(['systemctl','is-failed','--quiet','blancctl.service']).returncode!=0:
-                print("The VPN was stopped during the check; not reconnecting.")
-                return
-            recovered_latency=None if disabled_current or not now_active else pingtest(timeout)
-            if recovered_latency is not None:
-                log_event('failover',status='recovered_during_scan',latency_ms=recovered_latency)
-                print(f"Connection recovered during failover testing: {recovered_latency:.0f} ms")
-                save(FAILOVER,{'failures':0,'checked_at':int(time.time())})
-                return
-            print(f"Failing over to {n['label']} ({candidate_latency:.0f} ms).")
-            log_event('failover',status='switch_attempt',node_id=n['id'],latency_ms=candidate_latency)
-            try: select(n,ping=candidate_latency)
-            except SystemExit:
-                log_event('failover',status='switch_failed',node_id=n['id'])
-                print("Alternative failed its live check; trying the next cached server.")
-                continue
-            log_event('failover',status='switched',node_id=n['id'],latency_ms=candidate_latency)
-            save(FAILOVER,{'failures':0,'checked_at':int(time.time()),'switched_at':int(time.time())})
-            return
+    result=failover_candidates(candidates,selected,disabled_current,timeout)
+    if result!='none': return
     log_event('failover',status='no_working_alternative',candidates=len(candidates))
-    print("Failover could not find a working cached server; will retry later.")
+    now=int(time.time())
+    latest=load(FAILOVER,{})
+    if now-latest.get('emergency_refresh_at',0)<300:
+        print("No cached alternative passed; emergency subscription refresh is on cooldown.")
+        return
+    with try_operation_lock() as available:
+        if not available:
+            print("Configuration operation in progress; deferring emergency subscription refresh.")
+            return
+        if load(PICK,{}).get('id')!=selected.get('id'):
+            print("Connection changed during the check; deferring emergency subscription refresh.")
+            return
+        now_active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
+        if not now_active and subprocess.run(['systemctl','is-failed','--quiet','blancctl.service']).returncode!=0:
+            print("The VPN was stopped during the check; not refreshing it.")
+            return
+        save(FAILOVER,{**latest,'emergency_refresh_at':now,'checked_at':now})
+        print("No cached alternative passed; refreshing subscriptions through SOCKS, then the physical interface if needed…")
+        try: update(emergency=True)
+        except SystemExit:
+            log_event('failover',status='emergency_refresh_failed')
+            print("Emergency subscription refresh failed; cached profiles were kept.")
+            return
+    current,retained=cached_nodes()
+    fresh=[n for n in selectable_nodes(current+retained)
+           if n['id']!=selected.get('id')]
+    fresh=diverse_candidates(fresh,max_candidates)
+    print(f"Testing {len(fresh)} profiles after subscription refresh…")
+    result=failover_candidates(fresh,selected,disabled_current,timeout)
+    if result=='none': print("No refreshed server passed its live check; will retry later.")
 def record_speed():
     stats=load(STATS,{}); stats['speed_mbps']=speedtest(); stats['tested_at']=int(time.time()); save(STATS,stats)
 def best(ns,r,sites,selected_id=None,speeds=None):
@@ -960,15 +1019,35 @@ def best(ns,r,sites,selected_id=None,speeds=None):
             return winner
         return current
     return winner
-def benchmark_choice(ns,workers,timeout,fallback=()):
+def benchmark_options(ns,workers,timeout,fallback=()):
     r,sites=benchmark(ns,workers,timeout)
     if not any(r.get(n['id']) is not None for n in ns) and fallback:
         print(f"No current profile worked; checking {len(fallback)} retained backups…")
         ns=list(fallback)
         r,sites=benchmark(ns,workers,timeout)
+    if not any(r.get(n['id']) is not None for n in ns): return [],r
     selected_id=load(PICK,{}).get('id')
     speeds=benchmark_speeds(ns,r,sites,selected_id,workers,timeout)
-    return best(ns,r,sites,selected_id,speeds),r
+    remaining=[n for n in ns if r.get(n['id']) is not None]
+    ordered=[]
+    while remaining:
+        winner=best(remaining,r,sites,selected_id,speeds)
+        ordered.append(winner)
+        remaining.remove(winner)
+    return ordered,r
+def benchmark_choice(ns,workers,timeout,fallback=()):
+    ordered,r=benchmark_options(ns,workers,timeout,fallback)
+    if not ordered: die("no working server found")
+    return ordered[0],r
+def try_benchmarked(ordered,latencies):
+    for n in diverse_candidates(ordered,len(ordered)):
+        try: select(n,ping=latencies[n['id']])
+        except SystemExit:
+            log_event('selection',status='candidate_live_failed',node_id=n['id'])
+            print("Candidate failed its live check; trying another tested profile.")
+            continue
+        return True
+    return False
 def service(action):
     if os.getenv('BLANCCTL_NO_SERVICE')=='1': return
     owner=configured_owner(); user=current_user()
@@ -1037,13 +1116,28 @@ def select(n,restart=True,ping=None,speed=None,force=False):
     if disabled_node(n): die("Russia endpoints are disabled; no connection was changed")
     log_event('selection',status='started',node_id=n['id'],restart=restart)
     config=tun(n)
+    repairing_current=False
     if restart and not force and CONF.exists() and PICK.exists():
         previous_pick=load(PICK,{})
         if previous_pick.get('id')==n['id'] and load(CONF,{})==config:
             active=subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode==0
             if active:
-                print("Already using:",paint('36',n['label']))
-                return
+                live_timeout=adaptive_timeout(ping,10.0)
+                route_ok=routes_healthy()
+                socks_latency,tun_latency=live_paths(live_timeout)
+                failed=[]
+                if not route_ok: failed.append('routes')
+                if socks_latency is None: failed.append('SOCKS')
+                if tun_latency is None: failed.append('TUN')
+                if not failed:
+                    log_event('selection',status='already_healthy',node_id=n['id'],
+                              socks_latency_ms=socks_latency,tun_latency_ms=tun_latency)
+                    print("Already using (live check passed):",paint('36',n['label']))
+                    return
+                repairing_current=True
+                log_event('selection',status='repair_current',node_id=n['id'],
+                          failed=','.join(failed))
+                print(f"Current selection failed {', '.join(failed)} live checks; restarting it once.")
     with tempfile.TemporaryDirectory(prefix='blancctl-check-') as d:
         validation=dict(config)
         validation['inbounds']=[{'listen':'127.0.0.1','port':port(),'protocol':'socks',
@@ -1077,13 +1171,17 @@ def select(n,restart=True,ping=None,speed=None,force=False):
             for path,old_text in previous.items():
                 if old_text is None: path.unlink(missing_ok=True)
                 else: save_text(path,old_text)
+            reason=str(failure) if isinstance(failure,ConnectionError) else 'service restart failed'
+            if repairing_current:
+                die(f"{reason}; current configuration kept, but the connection remains unavailable")
             if previous[CONF] is not None:
                 try: service('restart')
                 except SystemExit: die("new connection failed; previous configuration was restored but its service restart failed")
-            reason=str(failure) if isinstance(failure,ConnectionError) else 'service restart failed'
             die(f"{reason}; previous configuration restored")
-    log_event('selection',status='selected',node_id=n['id'],latency_ms=ping,speed_mbps=speed)
-    print(paint('1;32','Selected:'),paint('36',n['label']))
+    status_name='recovered_current' if repairing_current else 'selected'
+    log_event('selection',status=status_name,node_id=n['id'],latency_ms=ping,speed_mbps=speed)
+    action='Recovered current server:' if repairing_current else 'Selected:'
+    print(paint('1;32',action),paint('36',n['label']))
 def start(_):
     old=load(PICK,{})
     current,retained=cached_nodes()
@@ -1183,10 +1281,13 @@ def update_status(_):
         print(f"Current: {state['current']}; retained: {state['retained']}")
 def allbest(a):
     current,retained=cached_nodes()
-    attempted_refresh=a.refresh or not selectable_nodes(current+retained)
+    no_cached_nodes=not selectable_nodes(current+retained)
+    attempted_refresh=a.refresh or no_cached_nodes
+    refresh_succeeded=False
     if attempted_refresh:
         try:
-            update()
+            update(emergency=True) if no_cached_nodes else update()
+            refresh_succeeded=True
             current,retained=cached_nodes()
         except SystemExit:
             if not (current or retained): raise
@@ -1200,8 +1301,23 @@ def allbest(a):
     if current and selected_backup: ns=current+[selected_backup]
     fallback=[n for n in retained if n is not selected_backup] if current else []
     service('routes')
-    n,r=benchmark_choice(ns,a.workers,a.timeout,fallback)
-    select(n,ping=r[n['id']])
+    for group in (ns,fallback):
+        if not group: continue
+        ordered,r=benchmark_options(group,a.workers,a.timeout)
+        if try_benchmarked(ordered,r): return
+    if refresh_succeeded: die("no cached or refreshed server passed the live SOCKS and TUN checks")
+    a.refresh_after=False
+    print("No cached server passed its live check; refreshing subscriptions through SOCKS, then the physical interface if needed…")
+    try: update(emergency=True)
+    except SystemExit:
+        die("emergency subscription refresh failed; cached profiles were kept")
+    current,retained=cached_nodes()
+    refreshed=selectable_nodes(compact_nodes(current+retained,load(PICK,{}).get('id')))
+    if refreshed:
+        service('routes')
+        ordered,r=benchmark_options(refreshed,a.workers,a.timeout)
+        if try_benchmarked(ordered,r): return
+    die("no server passed the live SOCKS and TUN checks after emergency refresh")
 def subscription(a):
     parts=a.args
     if parts==['list']:
@@ -1316,6 +1432,7 @@ def proxy(_): print(f"SOCKS5  {LOCAL_PROXY}")
 def main():
     require_user()
     p=argparse.ArgumentParser(prog='xray-ctl'); p.add_argument('--version',action='version',version=f'%(prog)s {VERSION}'); s=p.add_subparsers(dest='cmd')
+    s.add_parser('help',help='show this help message').set_defaults(fn=lambda _:p.print_help())
     s.add_parser('start').set_defaults(fn=start); s.add_parser('countries').set_defaults(fn=countries)
     c=s.add_parser('country'); c.add_argument('country'); c.add_argument('--workers',type=int,default=DEFAULT_WORKERS); c.add_argument('--timeout',type=float,default=DEFAULT_PROBE_TIMEOUT); c.set_defaults(fn=bycountry)
     s.add_parser('update').set_defaults(fn=refresh)
