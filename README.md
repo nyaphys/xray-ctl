@@ -142,18 +142,20 @@ uses the cache first for speed, then refreshes in the background.
 
 ## Split tunneling
 
-The default is proxy for all public destinations. Add only Russian sites that
-you have confirmed work directly; there is deliberately no blanket `.ru` or
-Russian-IP bypass, because some Russian sites still need the VPN.
-Version 0.6.4 includes one direct exception verified on the reported network:
-`cldom.ru` and its subdomains. Explicit `proxy` or `block` rules still take
-precedence. Disable this default with `xray-ctl route remove direct domain
-cldom.ru`; restore it with `xray-ctl route add direct domain cldom.ru`.
+The default is proxy for all public destinations. There is deliberately no
+blanket `.ru` or Russian-IP bypass, because some Russian sites still need the
+VPN. Verified direct exceptions are `cldom.ru` and, since 0.6.12, the Ozon
+service list (`geosite:ozon` from Xray's bundled geosite data). The latter
+covers `ozon.ru` and related service domains, not every Russian website.
+Explicit `proxy` or `block` rules still take precedence. Disable either
+default with `xray-ctl route remove direct domain cldom.ru` or
+`xray-ctl route remove direct domain geosite:ozon`; restore it with `route add`.
 
 ```console
 xray-ctl route show
-xray-ctl route test cldom.ru
+xray-ctl route test ozon.ru
 xray-ctl route add direct domain example.ru
+xray-ctl route add direct domain geosite:category-ecommerce-ru
 xray-ctl route add direct domain full:login.example.ru
 xray-ctl route add direct ip 203.0.113.0/24
 xray-ctl route apply
@@ -162,7 +164,9 @@ xray-ctl route apply
 `domain:example.ru` (the default form) matches the domain and subdomains;
 `full:example.ru` matches exactly. IP rules accept a single address or CIDR.
 Rules are saved to private `/var/lib/blancctl/routing.json` and take effect
-after `route apply` or the next connection selection. `route remove direct
+after `route apply` or the next connection selection. Broad geosite categories
+are opt-in only: check the site's direct path before enabling one, because a
+category does not prove reachability. `route remove direct
 domain example.ru` removes an exception. `route add proxy domain NAME` forces
 proxying and `route add block domain NAME` blocks a destination. For public
 traffic, block rules have highest priority, followed by proxy and direct
@@ -170,8 +174,11 @@ rules, then the default. `route default direct` reverses the default for special
 `route default proxy` restores the recommended mode. Local/private networks
 remain direct at the kernel and Xray layers.
 `route test DOMAIN` compares physical, TUN, and SOCKS HTTPS paths concurrently
-without editing configuration. It shows domain-rule intent but cannot prove
-which IP/geosite rule Xray applied, and does not test browser subresources or QUIC.
+without editing configuration. It previews known built-in geosite matches but
+cannot prove which rule Xray applied, and does not test browser subresources or
+QUIC. `route apply` validates Xray and requires its service to remain active;
+it no longer rejects a routing change solely because the selected VPN server
+was already unreachable. Test site reachability separately afterwards.
 
 Domain rules rely on Xray sniffing HTTP, TLS, and QUIC hostnames on both TUN
 and the local SOCKS inbound; applications

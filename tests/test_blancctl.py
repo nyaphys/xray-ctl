@@ -183,14 +183,15 @@ class NodeCacheTests(unittest.TestCase):
              mock.patch.object(blancctl, 'ROUTES', pathlib.Path(tmp)/'routing.json'):
             config = blancctl.routing_config()
             self.assertEqual(config['default'], 'proxy')
-            self.assertEqual(config['direct']['domains'], ['domain:cldom.ru'])
+            self.assertEqual(config['direct']['domains'], ['domain:cldom.ru', 'geosite:ozon'])
             self.assertEqual(blancctl.routing_rules()[-1]['outboundTag'], 'proxy')
             blancctl.save(blancctl.ROUTES, {'default':'proxy',
                          'direct':{'domains':['example.ru', 'full:sub.example.ru'],
                                    'ips':['192.0.2.3']}})
             rules = blancctl.routing_rules()
             self.assertEqual(rules[-3]['domain'],
-                             ['domain:example.ru', 'full:sub.example.ru', 'domain:cldom.ru'])
+                             ['domain:example.ru', 'full:sub.example.ru',
+                              'domain:cldom.ru', 'geosite:ozon'])
             self.assertEqual(rules[-1]['outboundTag'], 'proxy')
             self.assertNotIn('geoip:ru', str(rules))
 
@@ -254,9 +255,10 @@ class NodeCacheTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             blancctl.route(argparse.Namespace(args=['add','direct','domain','example.ru']))
             self.assertEqual(blancctl.routing_config()['direct']['domains'],
-                             ['domain:cldom.ru', 'domain:example.ru'])
+                             ['domain:cldom.ru', 'geosite:ozon', 'domain:example.ru'])
             blancctl.route(argparse.Namespace(args=['remove','direct','domain','example.ru']))
-            self.assertEqual(blancctl.routing_config()['direct']['domains'], ['domain:cldom.ru'])
+            self.assertEqual(blancctl.routing_config()['direct']['domains'],
+                             ['domain:cldom.ru', 'geosite:ozon'])
             select.assert_not_called()
 
     def test_verified_default_can_be_removed_and_restored(self):
@@ -264,10 +266,11 @@ class NodeCacheTests(unittest.TestCase):
              mock.patch.object(blancctl, 'ROUTES', pathlib.Path(tmp)/'routing.json'), \
              contextlib.redirect_stdout(io.StringIO()):
             blancctl.route(argparse.Namespace(args=['remove','direct','domain','cldom.ru']))
-            self.assertEqual(blancctl.routing_config()['direct']['domains'], [])
+            self.assertEqual(blancctl.routing_config()['direct']['domains'], ['geosite:ozon'])
             self.assertEqual(blancctl.routing_config()['disabled_defaults'], ['domain:cldom.ru'])
             blancctl.route(argparse.Namespace(args=['add','direct','domain','cldom.ru']))
-            self.assertEqual(blancctl.routing_config()['direct']['domains'], ['domain:cldom.ru'])
+            self.assertEqual(blancctl.routing_config()['direct']['domains'],
+                             ['geosite:ozon', 'domain:cldom.ru'])
             self.assertEqual(blancctl.routing_config()['disabled_defaults'], [])
 
     def test_user_proxy_rule_precedes_verified_direct_default(self):
@@ -280,6 +283,21 @@ class NodeCacheTests(unittest.TestCase):
             direct_at=next(i for i, rule in enumerate(rules) if rule.get('outboundTag')=='direct'
                            and 'domain:cldom.ru' in rule.get('domain',[]))
             self.assertLess(proxy_at,direct_at)
+
+    def test_ozon_geosite_default_can_be_disabled_and_proxy_overridden(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(blancctl, 'ROUTES', pathlib.Path(tmp)/'routing.json'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(blancctl.domain_route('www.ozon.ru',blancctl.routing_config()),
+                             ('direct','geosite:ozon'))
+            self.assertEqual(blancctl.domain_route('cdn.ozonusercontent.com',blancctl.routing_config()),
+                             ('direct','geosite:ozon'))
+            blancctl.route(argparse.Namespace(args=['add','proxy','domain','ozon.ru']))
+            self.assertEqual(blancctl.domain_route('www.ozon.ru',blancctl.routing_config()),
+                             ('proxy','domain:ozon.ru'))
+            blancctl.route(argparse.Namespace(args=['remove','direct','domain','geosite:ozon']))
+            self.assertNotIn('geosite:ozon',blancctl.routing_config()['direct']['domains'])
+            self.assertIn('geosite:ozon',blancctl.routing_config()['disabled_defaults'])
 
     def test_domain_route_matches_subdomains_and_higher_priority_rules(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -306,7 +324,7 @@ class NodeCacheTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()) as output:
             blancctl.route(argparse.Namespace(args=['test','cldom.ru']))
         self.assertEqual(probe.call_count,3)
-        self.assertIn('Domain rule: direct',output.getvalue())
+        self.assertIn('Expected domain rule: direct',output.getvalue())
         self.assertIn('physical: HTTP 200',output.getvalue())
         self.assertIn('tun: HTTP 200',output.getvalue())
         self.assertIn('socks: HTTP 200',output.getvalue())
@@ -320,6 +338,31 @@ class NodeCacheTests(unittest.TestCase):
         self.assertIn('--max-redirs',command)
         self.assertIn('--interface',command)
         self.assertIn('--noproxy',command)
+
+    def test_route_apply_does_not_reject_valid_rules_for_unhealthy_proxy(self):
+        node=sample('Selected','example.org')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=pathlib.Path(tmp)
+            with mock.patch.multiple(blancctl,STATE=root,ROUTES=root/'routing.json',
+                                     CONF=root/'xray.json',PICK=root/'selected.json',
+                                     STATS=root/'stats.json'), \
+                 mock.patch.object(blancctl,'cached_nodes',return_value=([node],[])), \
+                 mock.patch.object(blancctl,'physical_interface',return_value='wlan0'), \
+                 mock.patch.object(blancctl,'port',return_value=18080), \
+                 mock.patch.object(blancctl.subprocess,'run',
+                                   return_value=subprocess.CompletedProcess([],0)), \
+                 mock.patch.object(blancctl,'service') as service, \
+                 mock.patch.object(blancctl,'live_paths') as live_paths, \
+                 mock.patch.dict(os.environ,{'BLANCCTL_NO_SERVICE':''}), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                blancctl.save(blancctl.PICK,{'id':node['id']})
+                blancctl.save(blancctl.STATS,{'ping_ms':124})
+                blancctl.route(argparse.Namespace(args=['apply']))
+                self.assertEqual(blancctl.load(blancctl.STATS,{}),{'ping_ms':124})
+                self.assertIn('geosite:ozon',str(blancctl.load(blancctl.CONF,{})))
+            service.assert_called_once_with('restart')
+            live_paths.assert_not_called()
+            self.assertIn('site reachability was not inferred',output.getvalue())
 
     @unittest.skipUnless(shutil.which('xray') and shutil.which('curl'),
                          'Xray and curl are required')

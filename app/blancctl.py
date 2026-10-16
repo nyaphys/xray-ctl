@@ -31,8 +31,11 @@ SPEED_CANDIDATES = 4
 SPEED_GAIN_THRESHOLD = 1.3
 ROUTE_MARK = 4269
 COLOR = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
-VERSION = "0.6.11"
-DEFAULT_DIRECT_DOMAINS = ('domain:cldom.ru',)
+VERSION = "0.6.12"
+# These are service-specific exceptions confirmed to work on the reported
+# physical network. Never bypass all .ru names or geoip:ru by default.
+DEFAULT_DIRECT_DOMAINS = ('domain:cldom.ru', 'geosite:ozon')
+GEOSITE_ROUTE_HINTS = {'geosite:ozon': ('ozon.ru', 'o3.ru', 'o3t.ru', 'ozonusercontent.com')}
 LOG_LIMIT = 2 * 1024 * 1024
 LOG_BACKUPS = 4
 
@@ -486,11 +489,15 @@ def routing_rules():
     rules.append({'type':'field','network':'tcp,udp','outboundTag':config['default']})
     return rules
 def domain_route(domain,config):
-    """Explain domain-only rules; IP/geosite rules need Xray to decide."""
+    """Preview explicit rules and a small known subset of bundled geosite rules."""
     for action in ('block','proxy','direct'):
         for value in config[action]['domains']:
             if value.startswith('full:') and domain==value[5:]: return action,value
             if value.startswith('domain:') and (domain==value[7:] or domain.endswith('.'+value[7:])):
+                return action,value
+            if value in GEOSITE_ROUTE_HINTS and any(
+                    domain==name or domain.endswith('.'+name)
+                    for name in GEOSITE_ROUTE_HINTS[value]):
                 return action,value
     return config['default'],'default'
 def route_probe(url,path,interface=None):
@@ -512,7 +519,7 @@ def diagnose_route(domain):
     if normalized.startswith('geosite:'): die('route test requires a hostname')
     host=normalized.split(':',1)[1]
     action,rule=domain_route(host,routing_config())
-    print(f'Domain rule: {action} ({rule}); IP/geosite rules may take precedence in Xray.')
+    print(f'Expected domain rule: {action} ({rule}); Xray geosite data and IP rules may differ.')
     interface=physical_interface()
     url='https://'+host+'/'
     paths={'physical':interface,'tun':None,'socks':None}
@@ -1112,7 +1119,7 @@ def doctor(_):
         print(f"Repair with: sudo xray-ctl-setup {user}",file=sys.stderr)
         raise SystemExit(1)
     print(f"{paint('32','OK')}  xray-ctl {VERSION} is configured for {user}")
-def select(n,restart=True,ping=None,speed=None,force=False):
+def select(n,restart=True,ping=None,speed=None,force=False,routing_only=False):
     if disabled_node(n): die("Russia endpoints are disabled; no connection was changed")
     log_event('selection',status='started',node_id=n['id'],restart=restart)
     config=tun(n)
@@ -1151,20 +1158,25 @@ def select(n,restart=True,ping=None,speed=None,force=False):
     previous={p:p.read_text() if p.exists() else None for p in (CONF,PICK,STATS)}
     save(CONF,config)
     save(PICK,{'id':n['id'],'label':n['label'],'country_code':n['country_code'],'country':n['country']})
-    save(STATS,{'ping_ms':ping,'speed_mbps':speed,'tested_at':int(time.time())})
+    if not routing_only:
+        save(STATS,{'ping_ms':ping,'speed_mbps':speed,'tested_at':int(time.time())})
     if restart:
         try:
             service('restart')
             if os.getenv('BLANCCTL_NO_SERVICE')!='1':
-                route_ok=routes_healthy()
-                live_timeout=adaptive_timeout(ping,10.0)
-                socks_latency,tun_latency=live_paths(live_timeout)
-                failed=[]
-                if not route_ok: failed.append('routes')
-                if socks_latency is None: failed.append('SOCKS')
-                if tun_latency is None: failed.append('TUN')
-                if failed:
-                    raise ConnectionError("new server failed live check: "+', '.join(failed))
+                if routing_only:
+                    if subprocess.run(['systemctl','is-active','--quiet','blancctl.service']).returncode:
+                        raise ConnectionError('Xray service did not remain active after routing change')
+                else:
+                    route_ok=routes_healthy()
+                    live_timeout=adaptive_timeout(ping,10.0)
+                    socks_latency,tun_latency=live_paths(live_timeout)
+                    failed=[]
+                    if not route_ok: failed.append('routes')
+                    if socks_latency is None: failed.append('SOCKS')
+                    if tun_latency is None: failed.append('TUN')
+                    if failed:
+                        raise ConnectionError("new server failed live check: "+', '.join(failed))
         except (SystemExit,ConnectionError) as failure:
             log_event('selection',status='rollback',node_id=n['id'],
                       reason='live_probe' if isinstance(failure,ConnectionError) else 'restart')
@@ -1178,10 +1190,12 @@ def select(n,restart=True,ping=None,speed=None,force=False):
                 try: service('restart')
                 except SystemExit: die("new connection failed; previous configuration was restored but its service restart failed")
             die(f"{reason}; previous configuration restored")
-    status_name='recovered_current' if repairing_current else 'selected'
+    status_name='routing_applied' if routing_only else 'recovered_current' if repairing_current else 'selected'
     log_event('selection',status=status_name,node_id=n['id'],latency_ms=ping,speed_mbps=speed)
-    action='Recovered current server:' if repairing_current else 'Selected:'
+    action='Routing applied for:' if routing_only else 'Recovered current server:' if repairing_current else 'Selected:'
     print(paint('1;32',action),paint('36',n['label']))
+    if routing_only:
+        print('The Xray service is active; site reachability was not inferred from VPN health. Run: xray-ctl route test DOMAIN')
 def start(_):
     old=load(PICK,{})
     current,retained=cached_nodes()
@@ -1390,7 +1404,7 @@ def route(a):
         current,retained=cached_nodes()
         node=next((n for n in current+retained if n['id']==selected),None)
         if node is None: die("selected profile is not cached; run: xray-ctl best")
-        select(node,force=True)
+        select(node,force=True,routing_only=True)
         return
     die("use: xray-ctl route show|test DOMAIN|default proxy|direct|add ACTION domain|ip VALUE|remove ACTION domain|ip VALUE|apply")
 def status(_):
