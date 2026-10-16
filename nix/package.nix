@@ -13,7 +13,7 @@
 
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "xray-ctl";
-  version = "0.6.9";
+  version = "0.6.13";
 
   src = lib.fileset.toSource {
     root = ../.;

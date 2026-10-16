@@ -142,20 +142,23 @@ uses the cache first for speed, then refreshes in the background.
 
 ## Split tunneling
 
-The default is proxy for all public destinations. Add only Russian sites that
-you have confirmed work directly; there is deliberately no blanket `.ru` or
-Russian-IP bypass, because some Russian sites still need the VPN.
-Version 0.6.4 includes one direct exception verified on the reported network:
-`cldom.ru` and its subdomains. Explicit `proxy` or `block` rules still take
-precedence. Disable this default with `xray-ctl route remove direct domain
-cldom.ru`; restore it with `xray-ctl route add direct domain cldom.ru`.
+The default is VPN for non-Russian public destinations and direct for Russian
+destinations. Version 0.6.13 uses Xray's `geosite:category-ru` and `geoip:ru`
+datasets, plus explicit `.ru` and `.рф` suffix rules. The previous `cldom.ru`
+and Ozon rules remain for compatibility. This follows the domain/GeoIP rule-set
+pattern used by other clients; the locally installed NekoBox package also
+ships corresponding RU rule-set names. Classification is not perfect: a
+Russian service hosted abroad or using a new domain can be missed, while a
+non-Russian service on a Russian IP can go direct. Explicit user `proxy` and
+`block` rules still override the broad direct defaults.
 
 ```console
 xray-ctl route show
-xray-ctl route test cldom.ru
+xray-ctl route test ozon.ru
 xray-ctl route add direct domain example.ru
 xray-ctl route add direct domain full:login.example.ru
 xray-ctl route add direct ip 203.0.113.0/24
+xray-ctl route add proxy domain full:login.example.ru
 xray-ctl route apply
 ```
 
@@ -163,15 +166,24 @@ xray-ctl route apply
 `full:example.ru` matches exactly. IP rules accept a single address or CIDR.
 Rules are saved to private `/var/lib/blancctl/routing.json` and take effect
 after `route apply` or the next connection selection. `route remove direct
-domain example.ru` removes an exception. `route add proxy domain NAME` forces
+domain example.ru` removes an exception. Removing only `geosite:ozon` or
+`cldom.ru` does not send those sites through VPN while the broader RU rules
+still match; use a higher-priority `proxy` rule for a specific site. `route add proxy domain NAME` forces
 proxying and `route add block domain NAME` blocks a destination. For public
 traffic, block rules have highest priority, followed by proxy and direct
-rules, then the default. `route default direct` reverses the default for specialized setups;
+rules, then the default. For proxy-default mode, Xray's first outbound is the
+VPN fallback; `IPIfNonMatch` permits a DNS-assisted GeoIP pass before that
+fallback. `route default direct` reverses the default for specialized setups;
 `route default proxy` restores the recommended mode. Local/private networks
 remain direct at the kernel and Xray layers.
 `route test DOMAIN` compares physical, TUN, and SOCKS HTTPS paths concurrently
-without editing configuration. It shows domain-rule intent but cannot prove
-which IP/geosite rule Xray applied, and does not test browser subresources or QUIC.
+without editing configuration. It previews known built-in geosite matches but
+cannot prove which rule Xray applied, and does not test browser subresources or
+QUIC. It suggests a direct exception only when the physical request succeeds
+and both VPN paths fail; a SOCKS-only success instead points to a TUN issue.
+`route apply` validates Xray and requires its service to remain active;
+it no longer rejects a routing change solely because the selected VPN server
+was already unreachable. Test site reachability separately afterwards.
 
 Domain rules rely on Xray sniffing HTTP, TLS, and QUIC hostnames on both TUN
 and the local SOCKS inbound; applications
@@ -193,6 +205,12 @@ routing; see the [diagnostic procedure](docs/split-tunneling.md).
 after releasing its configuration lock. The command does not wait for that
 download; `update-status` shows whether it completed. `best --refresh` still
 downloads before testing when the new servers must be included immediately.
+If no cached candidate passes the final live SOCKS and TUN checks, `best`
+tries the other responsive profiles and retained backups, then performs one
+immediate subscription refresh and retests the refreshed cache. This emergency
+download tries the current SOCKS path first and, if it fails, binds curl to
+the physical network interface. The normal background refresh is skipped when
+the emergency refresh has already run.
 Russia (RU) endpoints remain in the private subscription/cache for recovery,
 but are excluded from `best`, failover, automatic start, `country` selection,
 and the `countries` list. Installing a new version does not interrupt an
@@ -219,9 +237,15 @@ still measures live download speed separately. After a switch, `xray-ctl`
 checks both the running SOCKS path and the system TUN path; if either fails, it
 restores the previous configuration and restarts the previous connection. If
 the already-running server and generated configuration are unchanged, `best`
-keeps that connection instead of restarting it.
+first checks its live SOCKS path, TUN path, and policy routes. It keeps the
+connection without a restart only when all three checks pass. Otherwise it
+restarts the current server once and verifies all three paths again; a failed
+repair is reported instead of printing a false `Already using` success.
+Profiles that pass a temporary benchmark but fail after activation do not end
+the search: `best` tries the remaining responsive profiles in endpoint-diverse
+order. Activation is sequential because the service has one TUN interface.
 
-Before testing, 0.6.9 refreshes host `throw` routes for every cached VPN
+Before testing, 0.6.11 refreshes host `throw` routes for every cached VPN
 endpoint. This is required while the catch-all TUN is already active: without
 those routes, a temporary candidate Xray can be chained through the currently
 selected VPN and the benchmark no longer measures that candidate directly.
@@ -267,13 +291,16 @@ NekoBox, `xray-ctl` does not use sing-box, and carrier-specific Extra profiles
 still depend on the subscription settings enabled by the provider.
 
 Automatic monitoring is enabled by `xray-ctl-setup` on Arch and by default in
-the NixOS module. In 0.6.9, `blancctl-failover.timer` checks both live SOCKS
+the NixOS module. In 0.6.11, `blancctl-failover.timer` checks both live SOCKS
 and ordinary TUN traffic against the four control sites after each 30-second
 interval. A transient failure keeps the current node. After repeated SOCKS
-failures, it first retries the same server, then tests up to six distinct
+failures, it first retries the same server, then tests up to 16 distinct
 cached alternatives in parallel, prioritizing site coverage and latency.
 If SOCKS works but the TUN route or data path fails, the timer repairs that
-path without switching nodes. Repairs have a cooldown to avoid restart loops.
+path first. If repair fails, it searches alternatives and refreshes subscriptions
+once if the cache has none that work. Emergency refreshes have a five-minute
+cooldown; a healthy SOCKS listener alone cannot stop a TUN failover. Repairs
+have a cooldown to avoid restart loops.
 This checks connectivity, not every browser subresource or every user rule;
 use `route test DOMAIN` for a particular site. Endpoint probes do not hold the
 configuration lock; the lock is taken only while changing the selected server.
