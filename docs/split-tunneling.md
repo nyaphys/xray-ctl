@@ -19,13 +19,27 @@ policy routing. Правила Xray хранятся локально и при�
 широкое `direct`-правило. `domain:example.ru` охватывает домен и поддомены;
 `full:example.ru` — только точное имя. Значение без префикса нормализуется
 в `domain:`. `geosite:NAME` использует встроенный в Xray список доменов
-сервиса. Автоматического прямого обхода всей зоны `.ru` нет: часть таких
-сайтов работает лишь через VPN.
+сервиса. Начиная с 0.6.13 российские назначения по умолчанию идут
+напрямую, остальной публичный трафик — через VPN:
+
+| Прямое правило | Зачем |
+| --- | --- |
+| `domain:ru`, `domain:xn--p1ai` | `.ru` и `.рф`, включая поддомены. |
+| `geosite:category-ru` | Российские сервисы в иных доменных зонах и других российских TLD. |
+| `geoip:ru` | Российские IP, включая соединения без видимого имени. |
+| `geosite:ozon`, `domain:cldom.ru` | Сохранённые прежние исключения. |
+
+Для домена, который не совпал с доменными правилами, Xray использует
+`IPIfNonMatch`: проверяет адрес через DNS/GeoIP перед отправкой в VPN.
+Это приближённая классификация, а не гарантия, что каждый российский сайт
+будет найден или что каждый найденный сайт откроется напрямую. Например,
+чужой сервис на российском IP тоже может уйти напрямую. Для отдельного сайта
+можно задать более приоритетное `proxy`-правило.
 
 ```console
 xray-ctl route show
 xray-ctl route add direct domain example.ru
-xray-ctl route add direct domain geosite:category-ecommerce-ru
+xray-ctl route add proxy domain full:login.example.ru
 xray-ctl route add proxy domain full:blocked.example.ru
 xray-ctl route add block ip 203.0.113.7
 xray-ctl route apply
@@ -59,12 +73,11 @@ xray-ctl route apply
 xray-ctl route test ozon.ru
 ```
 
-Если на вашей сети Ozon должен идти через VPN, добавьте приоритетное
-`proxy`-правило для нужного домена; чтобы отключить весь предустановленный
-список Ozon, выполните `xray-ctl route remove direct domain geosite:ozon` и
-`xray-ctl route apply`. Для других сервисов применяйте правило лишь после
-проверки прямого пути: географическая или тематическая категория сообщает,
-кому принадлежит домен, но не доказывает его доступность без VPN.
+Если на вашей сети Ozon должен идти через VPN, добавьте более приоритетное
+`proxy`-правило для нужного домена. Удаление одного `geosite:ozon` больше
+не переключит Ozon на VPN: остаются общие российские правила. При сбое
+прямого пути для любого российского сайта `route test DOMAIN` покажет
+сравнение, а `route add proxy domain DOMAIN` задаст точечный обход.
 
 ## Случай cldom.ru: что действительно установлено
 
@@ -129,7 +142,7 @@ xray-ctl route apply
    `curl --noproxy '*' --interface ИНТЕРФЕЙС https://DOMAIN/`. Это одноразовый
    диагностический запрос без изменения правил.
 3. Если физический путь работает, а TUN/SOCKS — нет, проверить политику
-   `xray-ctl route show` и добавить только проверенное исключение. Если оба
+   `xray-ctl route show` и срабатывание широкого правила. Если оба
    пути не работают, одного правила `direct` недостаточно; искать DNS,
    транспорт или недоступность сайта.
 4. Если SOCKS уже работает, а браузер — нет, проверять его собственный
@@ -159,6 +172,12 @@ xray-ctl route apply
 [sing-box](https://sing-box.sagernet.org/configuration/route/).
 [Список Ozon](https://github.com/v2fly/domain-list-community/blob/master/data/ozon)
 поддерживает проект domain-list-community; он не является тестом доступности.
+[Категория RU](https://github.com/v2fly/domain-list-community/blob/master/data/category-ru)
+включает российские TLD и сервисы. Установленный здесь пакет NekoBox
+содержит имена наборов `geosite-category-ru`, `geosite-tld-ru` и `geoip-ru`;
+его личные профили и настройки не просматривались. Исходный код
+[NekoBox/Nekoray](https://github.com/MatsuriDayo/nekoray/blob/main/db/ConfigBuilder.cpp)
+подтверждает отдельные списки для доменов, GeoIP и финальный маршрут.
 
 ## Почему `best` мог показать почти все узлы как недоступные
 

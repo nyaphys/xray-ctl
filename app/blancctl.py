@@ -31,11 +31,12 @@ SPEED_CANDIDATES = 4
 SPEED_GAIN_THRESHOLD = 1.3
 ROUTE_MARK = 4269
 COLOR = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
-VERSION = "0.6.12"
-# Main sites were observed to work on the reported physical network; the
-# full service list is a routing aid, not a reachability guarantee.
-# Never bypass all .ru names or geoip:ru by default.
-DEFAULT_DIRECT_DOMAINS = ('domain:cldom.ru', 'geosite:ozon')
+VERSION = "0.6.13"
+# Direct Russian destinations by default; other public traffic uses the VPN.
+# Country/domain datasets are approximations, not proof of site ownership.
+DEFAULT_DIRECT_DOMAINS = ('domain:cldom.ru', 'geosite:ozon',
+                          'geosite:category-ru', 'domain:ru', 'domain:xn--p1ai')
+DEFAULT_DIRECT_IPS = ('geoip:ru',)
 GEOSITE_ROUTE_HINTS = {'geosite:ozon': ('ozon.ru', 'o3.ru', 'o3t.ru', 'ozonusercontent.com')}
 LOG_LIMIT = 2 * 1024 * 1024
 LOG_BACKUPS = 4
@@ -461,8 +462,9 @@ def routing_config():
     disabled=raw.get('disabled_defaults',[])
     if not isinstance(disabled,list) or any(not isinstance(v,str) for v in disabled):
         die("invalid disabled routing defaults")
-    disabled=list(dict.fromkeys(normalize_route_value('domains',v) for v in disabled))
-    if any(v not in DEFAULT_DIRECT_DOMAINS for v in disabled):
+    disabled=list(dict.fromkeys(normalize_route_value(
+        'ips' if v.startswith('geoip:') else 'domains',v) for v in disabled))
+    if any(v not in DEFAULT_DIRECT_DOMAINS+DEFAULT_DIRECT_IPS for v in disabled):
         die("unknown disabled routing default")
     result={'default':default,'disabled_defaults':disabled}
     for action in ('direct','proxy','block'):
@@ -478,16 +480,23 @@ def routing_config():
     result['direct']['domains']=list(dict.fromkeys(
         [v for v in result['direct']['domains'] if v not in disabled]
         +[v for v in DEFAULT_DIRECT_DOMAINS if v not in disabled]))
+    result['direct']['ips']=list(dict.fromkeys(
+        [v for v in result['direct']['ips'] if v not in disabled]
+        +[v for v in DEFAULT_DIRECT_IPS if v not in disabled]))
     return result
 def routing_rules():
     config=routing_config()
     rules=[{'type':'field','ip':['geoip:private'],'outboundTag':'direct'}]
     for action in ('block','proxy','direct'):
-        for kind in ('domains','ips'):
-            values=config[action][kind]
-            if values: rules.append({'type':'field','domain' if kind=='domains' else 'ip':values,
-                                     'outboundTag':action})
-    rules.append({'type':'field','network':'tcp,udp','outboundTag':config['default']})
+        values=config[action]['domains']
+        if values: rules.append({'type':'field','domain':values,'outboundTag':action})
+    for action in ('block','proxy','direct'):
+        values=config[action]['ips']
+        if values: rules.append({'type':'field','ip':values,'outboundTag':action})
+    # With IPIfNonMatch, a proxy catch-all would match before GeoIP's DNS pass.
+    # Xray's first outbound is proxy, so no explicit final rule is needed here.
+    if config['default']=='direct':
+        rules.append({'type':'field','network':'tcp,udp','outboundTag':'direct'})
     return rules
 def domain_route(domain,config):
     """Preview explicit rules and a small known subset of bundled geosite rules."""
@@ -558,7 +567,7 @@ def tun(n):
        {'tag':'socks-in','listen':'127.0.0.1','port':10808,'protocol':'socks','settings':{'udp':True},
         'sniffing':sniffing}],
       'outbounds':[outbound(n,interface,ROUTE_MARK),direct,{'tag':'block','protocol':'blackhole'}],
-      'routing':{'domainStrategy':'AsIs','rules':routing_rules()}}
+      'routing':{'domainStrategy':'IPIfNonMatch','rules':routing_rules()}}
 def socks(n,port,interface=None):
     return {'log':{'loglevel':'none'},'inbounds':[{'listen':'127.0.0.1','port':port,'protocol':'socks','settings':{'udp':True}}],
       'outbounds':[outbound(n,interface or physical_interface())],'routing':{'rules':[{'type':'field','network':'tcp,udp','outboundTag':'proxy'}]}}
@@ -1413,7 +1422,8 @@ def route(a):
                 config['disabled_defaults'].remove(value)
         if parts[0]=='remove':
             if value in values: values.remove(value)
-            if action=='direct' and value in DEFAULT_DIRECT_DOMAINS and value not in config['disabled_defaults']:
+            if action=='direct' and value in DEFAULT_DIRECT_DOMAINS+DEFAULT_DIRECT_IPS \
+                    and value not in config['disabled_defaults']:
                 config['disabled_defaults'].append(value)
         save(ROUTES,config)
         print("Routing rule saved; run: xray-ctl route apply")

@@ -178,22 +178,24 @@ class NodeCacheTests(unittest.TestCase):
                 self.assertEqual(blancctl.load(blancctl.NODES, []), [old])
                 self.assertIn('trojan://unsupported', blancctl.RAW.read_text())
 
-    def test_route_defaults_proxy_and_verified_direct_exception(self):
+    def test_route_defaults_proxy_with_broad_russian_direct_rules(self):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(blancctl, 'ROUTES', pathlib.Path(tmp)/'routing.json'):
             config = blancctl.routing_config()
             self.assertEqual(config['default'], 'proxy')
-            self.assertEqual(config['direct']['domains'], ['domain:cldom.ru', 'geosite:ozon'])
-            self.assertEqual(blancctl.routing_rules()[-1]['outboundTag'], 'proxy')
+            self.assertEqual(config['direct']['domains'], list(blancctl.DEFAULT_DIRECT_DOMAINS))
+            self.assertEqual(config['direct']['ips'], ['geoip:ru'])
+            self.assertFalse(any(rule.get('network')=='tcp,udp'
+                                 for rule in blancctl.routing_rules()))
             blancctl.save(blancctl.ROUTES, {'default':'proxy',
                          'direct':{'domains':['example.ru', 'full:sub.example.ru'],
                                    'ips':['192.0.2.3']}})
             rules = blancctl.routing_rules()
-            self.assertEqual(rules[-3]['domain'],
-                             ['domain:example.ru', 'full:sub.example.ru',
-                              'domain:cldom.ru', 'geosite:ozon'])
-            self.assertEqual(rules[-1]['outboundTag'], 'proxy')
-            self.assertNotIn('geoip:ru', str(rules))
+            self.assertIn({'type':'field','domain':[
+                'domain:example.ru', 'full:sub.example.ru',
+                *blancctl.DEFAULT_DIRECT_DOMAINS], 'outboundTag':'direct'},rules)
+            self.assertIn({'type':'field','ip':['192.0.2.3/32','geoip:ru'],
+                           'outboundTag':'direct'},rules)
 
     @unittest.skipUnless(shutil.which('xray'), 'Xray is not installed')
     def test_split_routing_passes_xray_validation(self):
@@ -255,10 +257,10 @@ class NodeCacheTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             blancctl.route(argparse.Namespace(args=['add','direct','domain','example.ru']))
             self.assertEqual(blancctl.routing_config()['direct']['domains'],
-                             ['domain:cldom.ru', 'geosite:ozon', 'domain:example.ru'])
+                             [*blancctl.DEFAULT_DIRECT_DOMAINS,'domain:example.ru'])
             blancctl.route(argparse.Namespace(args=['remove','direct','domain','example.ru']))
             self.assertEqual(blancctl.routing_config()['direct']['domains'],
-                             ['domain:cldom.ru', 'geosite:ozon'])
+                             list(blancctl.DEFAULT_DIRECT_DOMAINS))
             select.assert_not_called()
 
     def test_verified_default_can_be_removed_and_restored(self):
@@ -266,12 +268,45 @@ class NodeCacheTests(unittest.TestCase):
              mock.patch.object(blancctl, 'ROUTES', pathlib.Path(tmp)/'routing.json'), \
              contextlib.redirect_stdout(io.StringIO()):
             blancctl.route(argparse.Namespace(args=['remove','direct','domain','cldom.ru']))
-            self.assertEqual(blancctl.routing_config()['direct']['domains'], ['geosite:ozon'])
+            self.assertEqual(blancctl.routing_config()['direct']['domains'],
+                             list(blancctl.DEFAULT_DIRECT_DOMAINS[1:]))
             self.assertEqual(blancctl.routing_config()['disabled_defaults'], ['domain:cldom.ru'])
+            self.assertEqual(blancctl.domain_route('cldom.ru',blancctl.routing_config()),
+                             ('direct','domain:ru'))
             blancctl.route(argparse.Namespace(args=['add','direct','domain','cldom.ru']))
             self.assertEqual(blancctl.routing_config()['direct']['domains'],
-                             ['geosite:ozon', 'domain:cldom.ru'])
+                             [*blancctl.DEFAULT_DIRECT_DOMAINS[1:],'domain:cldom.ru'])
             self.assertEqual(blancctl.routing_config()['disabled_defaults'], [])
+
+    def test_russian_geoip_default_can_be_disabled_and_restored(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(blancctl,'ROUTES',pathlib.Path(tmp)/'routing.json'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            blancctl.route(argparse.Namespace(args=['remove','direct','ip','geoip:ru']))
+            self.assertNotIn('geoip:ru',blancctl.routing_config()['direct']['ips'])
+            self.assertIn('geoip:ru',blancctl.routing_config()['disabled_defaults'])
+            blancctl.route(argparse.Namespace(args=['add','direct','ip','geoip:ru']))
+            self.assertIn('geoip:ru',blancctl.routing_config()['direct']['ips'])
+            self.assertNotIn('geoip:ru',blancctl.routing_config()['disabled_defaults'])
+
+    def test_russian_suffixes_are_direct_and_other_domains_fall_back_to_proxy(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(blancctl,'ROUTES',pathlib.Path(tmp)/'routing.json'):
+            config=blancctl.routing_config()
+            self.assertEqual(blancctl.domain_route('www.example.ru',config),
+                             ('direct','domain:ru'))
+            idn=blancctl.normalize_route_value('domains','пример.рф').split(':',1)[1]
+            self.assertEqual(blancctl.domain_route(idn,config),
+                             ('direct','domain:xn--p1ai'))
+            self.assertEqual(blancctl.domain_route('example.org',config),
+                             ('proxy','default'))
+
+    def test_direct_default_keeps_an_explicit_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(blancctl,'ROUTES',pathlib.Path(tmp)/'routing.json'):
+            blancctl.save(blancctl.ROUTES,{'default':'direct'})
+            self.assertEqual(blancctl.routing_rules()[-1],
+                             {'type':'field','network':'tcp,udp','outboundTag':'direct'})
 
     def test_user_proxy_rule_precedes_verified_direct_default(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -337,8 +372,8 @@ class NodeCacheTests(unittest.TestCase):
              mock.patch.object(blancctl,'route_probe',
                                side_effect=lambda url,path,device:results[path]), \
              contextlib.redirect_stdout(io.StringIO()) as output:
-            blancctl.diagnose_route('example.ru')
-        self.assertIn('route add direct domain example.ru',output.getvalue())
+            blancctl.diagnose_route('example.org')
+        self.assertIn('route add direct domain example.org',output.getvalue())
         results['socks']='HTTP 200 in 0.2 s'
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(blancctl,'ROUTES',pathlib.Path(tmp)/'routing.json'), \
@@ -346,7 +381,7 @@ class NodeCacheTests(unittest.TestCase):
              mock.patch.object(blancctl,'route_probe',
                                side_effect=lambda url,path,device:results[path]), \
              contextlib.redirect_stdout(io.StringIO()) as output:
-            blancctl.diagnose_route('example.ru')
+            blancctl.diagnose_route('example.org')
         self.assertNotIn('route add direct domain',output.getvalue())
         self.assertIn('SOCKS works but TUN does not',output.getvalue())
 
@@ -1148,8 +1183,9 @@ class NodeCacheTests(unittest.TestCase):
         self.assertTrue(config['inbounds'][0]['sniffing']['routeOnly'])
         self.assertEqual(config['inbounds'][1]['sniffing'], config['inbounds'][0]['sniffing'])
         self.assertEqual(config['routing']['rules'][0]['ip'], ['geoip:private'])
-        self.assertNotIn('geoip:ru', str(config['routing']))
-        self.assertNotIn('ru|xn--p1ai', str(config['routing']))
+        self.assertIn('geoip:ru', str(config['routing']))
+        self.assertIn('geosite:category-ru', str(config['routing']))
+        self.assertEqual(config['routing']['domainStrategy'],'IPIfNonMatch')
         self.assertEqual(config['outbounds'][0]['streamSettings']['sockopt']['mark'],4269)
         self.assertEqual(config['outbounds'][1]['streamSettings']['sockopt']['mark'],4269)
 
