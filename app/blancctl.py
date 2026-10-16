@@ -32,8 +32,9 @@ SPEED_GAIN_THRESHOLD = 1.3
 ROUTE_MARK = 4269
 COLOR = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
 VERSION = "0.6.12"
-# These are service-specific exceptions confirmed to work on the reported
-# physical network. Never bypass all .ru names or geoip:ru by default.
+# Main sites were observed to work on the reported physical network; the
+# full service list is a routing aid, not a reachability guarantee.
+# Never bypass all .ru names or geoip:ru by default.
 DEFAULT_DIRECT_DOMAINS = ('domain:cldom.ru', 'geosite:ozon')
 GEOSITE_ROUTE_HINTS = {'geosite:ozon': ('ozon.ru', 'o3.ru', 'o3t.ru', 'ozonusercontent.com')}
 LOG_LIMIT = 2 * 1024 * 1024

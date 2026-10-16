@@ -144,9 +144,11 @@ uses the cache first for speed, then refreshes in the background.
 
 The default is proxy for all public destinations. There is deliberately no
 blanket `.ru` or Russian-IP bypass, because some Russian sites still need the
-VPN. Verified direct exceptions are `cldom.ru` and, since 0.6.12, the Ozon
+VPN. Default direct exceptions are `cldom.ru` and, since 0.6.12, the Ozon
 service list (`geosite:ozon` from Xray's bundled geosite data). The latter
 covers `ozon.ru` and related service domains, not every Russian website.
+The main site was observed to work directly on the reported network; that
+does not establish reachability for every domain in the service list.
 Explicit `proxy` or `block` rules still take precedence. Disable either
 default with `xray-ctl route remove direct domain cldom.ru` or
 `xray-ctl route remove direct domain geosite:ozon`; restore it with `route add`.
