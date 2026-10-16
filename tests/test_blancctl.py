@@ -329,6 +329,27 @@ class NodeCacheTests(unittest.TestCase):
         self.assertIn('tun: HTTP 200',output.getvalue())
         self.assertIn('socks: HTTP 200',output.getvalue())
 
+    def test_route_test_suggests_direct_only_when_both_vpn_paths_fail(self):
+        results={'physical':'HTTP 307 in 0.1 s','tun':'timeout','socks':'timeout'}
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(blancctl,'ROUTES',pathlib.Path(tmp)/'routing.json'), \
+             mock.patch.object(blancctl,'physical_interface',return_value='wlan0'), \
+             mock.patch.object(blancctl,'route_probe',
+                               side_effect=lambda url,path,device:results[path]), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            blancctl.diagnose_route('example.ru')
+        self.assertIn('route add direct domain example.ru',output.getvalue())
+        results['socks']='HTTP 200 in 0.2 s'
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(blancctl,'ROUTES',pathlib.Path(tmp)/'routing.json'), \
+             mock.patch.object(blancctl,'physical_interface',return_value='wlan0'), \
+             mock.patch.object(blancctl,'route_probe',
+                               side_effect=lambda url,path,device:results[path]), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            blancctl.diagnose_route('example.ru')
+        self.assertNotIn('route add direct domain',output.getvalue())
+        self.assertIn('SOCKS works but TUN does not',output.getvalue())
+
     def test_route_probe_does_not_follow_redirects_or_log_target(self):
         response=subprocess.CompletedProcess([],0,stdout='301 0.123',stderr='')
         with mock.patch.object(blancctl.subprocess,'run',return_value=response) as run:

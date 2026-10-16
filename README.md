@@ -176,7 +176,9 @@ remain direct at the kernel and Xray layers.
 `route test DOMAIN` compares physical, TUN, and SOCKS HTTPS paths concurrently
 without editing configuration. It previews known built-in geosite matches but
 cannot prove which rule Xray applied, and does not test browser subresources or
-QUIC. `route apply` validates Xray and requires its service to remain active;
+QUIC. It suggests a direct exception only when the physical request succeeds
+and both VPN paths fail; a SOCKS-only success instead points to a TUN issue.
+`route apply` validates Xray and requires its service to remain active;
 it no longer rejects a routing change solely because the selected VPN server
 was already unreachable. Test site reachability separately afterwards.
 

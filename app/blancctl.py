@@ -525,7 +525,25 @@ def diagnose_route(domain):
     paths={'physical':interface,'tun':None,'socks':None}
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         jobs={name:pool.submit(route_probe,url,name,device) for name,device in paths.items()}
-        for name,job in jobs.items(): print(f'{name}: {job.result()}')
+        results={name:job.result() for name,job in jobs.items()}
+    for name,result in results.items(): print(f'{name}: {result}')
+    reachable=lambda result: bool(re.match(r'HTTP [23][0-9][0-9] in ',result))
+    physical_ok=reachable(results['physical'])
+    tun_ok=reachable(results['tun'])
+    socks_ok=reachable(results['socks'])
+    if socks_ok and not tun_ok:
+        print('Suggestion: SOCKS works but TUN does not; inspect the TUN route and DNS before adding a domain rule.')
+    elif physical_ok and not socks_ok and not tun_ok:
+        if action=='direct':
+            print('Suggestion: a direct rule is already configured; check its Xray match, DNS, and direct outbound.')
+        elif action in ('proxy','block') and rule!='default':
+            print(f'Suggestion: the higher-priority {action} rule {rule} overrides direct; review it first.')
+        else:
+            print(f'Suggestion: direct works here; consider: xray-ctl route add direct domain {host}')
+    elif not physical_ok and (socks_ok or tun_ok):
+        print('Suggestion: the VPN path works; keep or add a proxy rule for this site.')
+    elif not physical_ok and not socks_ok and not tun_ok:
+        print('Suggestion: neither path passed; a routing rule alone is unlikely to fix this site.')
     print('These HTTP probes do not test browser subresources, QUIC, or a hidden SNI.')
 def tun(n):
     interface=physical_interface()
